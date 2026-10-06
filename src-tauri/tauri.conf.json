@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CubeLauncher",
+  "version": "0.1.0",
+  "identifier": "game.xinghai.cubelauncher",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "CubeLauncher",
+      "width": 1240,
+      "height": 780,
+      "minWidth": 1024,
+      "minHeight": 640,
+      "resizable": true,
+      "decorations": false,
+      "transparent": false
+    }],
+    "security": { "csp": "default-src 'self'; img-src 'self' asset: https: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'" }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["appimage", "deb", "nsis", "dmg"],
+    "shortDescription": "轻量、可控的 Minecraft Java 启动器",
+    "longDescription": "CubeLauncher 是一个支持离线账户、实例隔离和多加载器的 Minecraft Java 桌面启动器。",
+    "category": "Game",
+    "createUpdaterArtifacts": false
+  }
+}

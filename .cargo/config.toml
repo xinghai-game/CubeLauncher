@@ -1,0 +1,8 @@
+[source.crates-io]
+replace-with = "project-mirror"
+
+# CubeLauncher pins a reachable, up-to-date crates.io mirror for this project only,
+# because some regional mirrors lag behind and fail to resolve current dependencies.
+# Remove this file (or point it at your preferred registry) if your default works.
+[source.project-mirror]
+registry = "sparse+https://rsproxy.cn/index/"

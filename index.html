@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0e1411" />
+    <title>CubeLauncher</title>
+    <script>
+      // Apply the saved theme before first paint so the launcher never flashes the wrong palette.
+      (function () {
+        try {
+          var theme = localStorage.getItem('cubelauncher:theme') === 'light' ? 'light' : 'dark';
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        } catch (error) { /* storage unavailable: keep the dark default */ }
+      })();
+    </script>
+  </head>
+  <body><div id="app"></div><script type="module" src="/src/main.ts"></script></body>
+</html>

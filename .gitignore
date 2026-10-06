@@ -1,0 +1,26 @@
+# Rust / Tauri
+/target
+/src-tauri/target
+/src-tauri/gen
+
+# Frontend
+node_modules
+dist
+*.local
+.vite
+
+# Launcher runtime data (never commit user data)
+CubeLauncher/
+instances/
+libraries/
+assets/
+runtimes/
+metadata/
+
+# Editors and OS noise
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.swp
