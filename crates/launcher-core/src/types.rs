@@ -104,6 +104,15 @@ pub struct Instance {
     pub name: String,
     pub game_version: String,
     pub loader: Loader,
+    /// Exact version folder inside the game directory. Imported installations keep
+    /// the name the other launcher used (`1.20.1-forge-47.4.26`), because that is
+    /// what `versions/` and the version document are called on disk.
+    #[serde(default)]
+    pub version_id: Option<String>,
+    /// Game directory. `Some` means an imported `.minecraft` the user already had;
+    /// `None` means the launcher-managed directory inside the instance folder.
+    #[serde(default)]
+    pub game_dir: Option<PathBuf>,
     #[serde(default)]
     pub loader_version: Option<String>,
     #[serde(default)]
@@ -131,7 +140,6 @@ pub struct Instance {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaRuntime {
-    pub path: PathBuf,
     pub major: u32,
     pub architecture: String,
     pub vendor: Option<String>,

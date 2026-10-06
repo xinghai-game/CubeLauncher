@@ -190,3 +190,58 @@ cargo run -p launcher-core --example smoke -- versions forge 1.20.1
 Forge 与 Fabric 的 Maven 主机在本机存在 TLS 证书不匹配（证书只对某个 IP 有效），
 因此上述命令可附加 `--mirror https://bmclapi2.bangbang93.com`。镜像只改变下载地址，
 校验仍然使用官方元数据里的 SHA-1/SHA-256。
+
+## 11. 版本目录动态获取与页面分级（2026-10-07 追加）
+
+参考 HMCL 的两点改造：版本列表动态获取并分类，界面按层级组织。
+
+### 核心与数据
+
+- `launcher-core` 新增 `VersionCatalog`：清单里每个版本带上派生分类（正式版 / 快照 / 远古 Beta /
+  远古 Alpha / 愚人节），并记录列表来源（官方源 / 镜像 / 本地缓存）与缓存时间。
+- 愚人节分组沿用 HMCL 的做法，用已知 ID 列表判定；本机缓存的真实清单里 8 个 ID 全部命中：
+  `15w14a`、`1.RV-Pre1`、`3D Shareware v1.34`、`20w14infinite`、`22w13oneblockatatime`、
+  `23w13a_or_b`、`24w14potato`、`25w14craftmine`。
+- 缓存策略：6 小时内直接使用；过期时先尝试刷新，刷新失败仍返回旧缓存；`force` 时一定走网络，
+  严格离线模式下直接报错而不是静默失败。
+- 真实清单规模（本机缓存，2026-10-06 抓取）：917 个版本 = 103 正式版 / 753 快照 /
+  26 远古 Beta / 35 远古 Alpha。
+- 新增 `required_java_major`：版本元数据已在本地时用其中的 `javaVersion`，否则回退到受测版本表，
+  并注明来源；不联网、不阻塞界面。
+
+### 界面
+
+- `src/App.svelte` 变为外壳 + 分级路由，页面拆到 `src/components/`：
+  版本目录（分类标签 + 搜索 + 已安装标记 + 加载更多）→ 安装向导（加载器 → 加载器版本 → 确认）
+  → 安装进度页；设置改为分类页 → 子页，返回路径显示在面包屑里。
+- 向导里的加载器可用性完全来自动态查询：Fabric 走官方 Meta API，Forge/NeoForge 走各自 Maven
+  元数据；查不到时给出原因，并允许手动填写版本号。
+
+### 命令与结果
+
+| 项目 | 命令 | 结果 |
+| --- | --- | --- |
+| Rust 单测 | `cargo test -p launcher-core` | 43 passed; 0 failed |
+| Rust lint | `cargo clippy --all-targets -- -D warnings` | 无警告 |
+| Rust 格式 | `cargo fmt --all -- --check` | 通过 |
+| 前端单测 | `pnpm test` | 16 passed（版本分类筛选 12 + 主题 4） |
+| 类型检查 | `pnpm run check` | 0 errors, 0 warnings |
+| 前端构建 | `pnpm run build` | JS 182.95 kB（gzip 49.51 kB）、CSS 43.07 kB（gzip 9.07 kB） |
+
+界面截图见第 5 节表格，10 张全部由 Chromium 渲染构建产物得到；桩函数提供 `version_catalog`、
+`version_java`、`loader_versions` 与安装进度事件，其中 NeoForge 在 1.20.1 上按真实行为返回
+“没有找到支持版本”，截图中能看到这条动态结果。
+
+### 截图暴露并修复的问题
+
+| 问题 | 现象 | 修复 |
+| --- | --- | --- |
+| 面包屑竖排 | 全局 `nav { flex-direction: column }` 同样命中面包屑的 `<nav>` | 面包屑显式声明 `flex-direction: row` |
+| 安装页残留分支 | `InstallProgressPage` 保留着旧的“停止游戏”按钮，引用已删除的符号 | 类型检查报错后删除该分支 |
+
+### 并发说明
+
+改造期间另一个会话同时在改主题（`src/lib/theme.ts`、`styles.css` 设计令牌、`index.html`
+首帧脚本、`tests/theme.test.ts`）与元数据参数解析的健壮性（`ArgumentValue` 支持缺省 `rules`
+与未知形状）。两边改动都已保留：主题按钮接到 `chooseTheme`，Rust 侧统一跑过 `cargo fmt`。
+上面的数字是 2026-10-07 04:57 前后的快照；若那个会话继续改动同一批文件，需要重新执行本节命令。

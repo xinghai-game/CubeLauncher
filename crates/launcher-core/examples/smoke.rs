@@ -8,12 +8,13 @@
 //! cargo run -p launcher-core --example smoke -- install /tmp/cube alice 1.20.1 fabric
 //! cargo run -p launcher-core --example smoke -- verify /tmp/cube alice
 //! cargo run -p launcher-core --example smoke -- preview /tmp/cube alice
+//! cargo run -p launcher-core --example smoke -- catalog ~/.local/share/CubeLauncher
 //! cargo run -p launcher-core --example smoke -- launch /tmp/cube alice
 //! ```
 
 use anyhow::{bail, Result};
 use launcher_core::rules::current_arch;
-use launcher_core::{AppSettings, Instance, LauncherCore, Loader, Progress};
+use launcher_core::{AppSettings, Instance, LauncherCore, Loader, Progress, VersionKind};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -93,7 +94,7 @@ async fn main() -> Result<()> {
         }
     }
     let Some(command) = args.first().map(|value| value.as_str()) else {
-        bail!("用法：smoke <plan|install|verify|preview|launch|java|versions> …");
+        bail!("用法：smoke <plan|install|verify|preview|launch|java|versions|catalog> …");
     };
     match command {
         // Resolve metadata and print the install size without downloading anything.
@@ -112,6 +113,51 @@ async fn main() -> Result<()> {
                 plan.java_major
             );
             println!("继承链：{}", plan.resolved.chain.join(" -> "));
+        }
+        // Version list as the UI consumes it: categories, counts and provenance.
+        "catalog" => {
+            let data_dir = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "/tmp/cube-smoke".into());
+            // Offline on purpose: this must work from the cache alone.
+            let core = LauncherCore::new(settings_for(&data_dir, true)).await?;
+            let catalog = core.catalog(false).await?;
+            println!(
+                "版本目录：{} 个版本，来源 {}（来自缓存：{}），缓存时间 {}",
+                catalog.total,
+                catalog.source.label(),
+                if catalog.cached { "是" } else { "否" },
+                catalog
+                    .fetched_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "未知".into())
+            );
+            for kind in [
+                VersionKind::Release,
+                VersionKind::Snapshot,
+                VersionKind::OldBeta,
+                VersionKind::OldAlpha,
+                VersionKind::AprilFools,
+            ] {
+                let count = catalog
+                    .versions
+                    .iter()
+                    .filter(|version| version.kind == kind)
+                    .count();
+                println!("  {}：{count}", kind.label());
+            }
+            println!(
+                "最新正式版 {}，最新快照 {}",
+                catalog.latest.release, catalog.latest.snapshot
+            );
+            for id in ["1.20.1", "1.12.2", "b1.8.1"] {
+                let requirement = core.required_java_major(id).await;
+                println!(
+                    "  {id} 需要 Java {}（来源：{}）",
+                    requirement.major, requirement.source
+                );
+            }
         }
         "versions" => {
             let loader = match args.get(1).map(|value| value.as_str()) {

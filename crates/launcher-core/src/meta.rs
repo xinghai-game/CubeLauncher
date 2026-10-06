@@ -76,8 +76,7 @@ impl crate::LauncherCore {
 
     async fn fetch_manifest(&self) -> Result<(Manifest, ManifestSource)> {
         let bytes = self.downloader.fetch_bytes(MANIFEST_URL).await?;
-        let manifest: Manifest =
-            serde_json::from_slice(&bytes).context("解析版本清单失败")?;
+        let manifest: Manifest = serde_json::from_slice(&bytes).context("解析版本清单失败")?;
         crate::atomic_write(&self.manifest_cache_path(), &bytes).await?;
         let source = if self.downloader.map_url(MANIFEST_URL) == MANIFEST_URL {
             ManifestSource::Official
@@ -154,7 +153,10 @@ impl crate::LauncherCore {
     pub async fn required_java_major(&self, id: &str) -> JavaRequirement {
         let path = self.paths.versions_dir().join(format!("{id}.json"));
         if let Ok(meta) = self.version_meta_from_path(&path).await {
-            if let Some(major) = meta.java_version.as_ref().and_then(|value| value.major_version)
+            if let Some(major) = meta
+                .java_version
+                .as_ref()
+                .and_then(|value| value.major_version)
             {
                 return JavaRequirement {
                     major,
@@ -203,8 +205,8 @@ impl crate::LauncherCore {
                 bail!("版本 {id} 的元数据校验失败，请重试或检查网络");
             }
         }
-        let meta: VersionMeta =
-            serde_json::from_slice(&bytes).with_context(|| format!("解析版本 {id} 的元数据失败"))?;
+        let meta: VersionMeta = serde_json::from_slice(&bytes)
+            .with_context(|| format!("解析版本 {id} 的元数据失败"))?;
         crate::atomic_write(&path, &bytes).await?;
         Ok(meta)
     }
@@ -214,7 +216,8 @@ impl crate::LauncherCore {
         let bytes = tokio::fs::read(path)
             .await
             .with_context(|| format!("读取版本文件失败：{}", path.display()))?;
-        serde_json::from_slice(&bytes).context("解析本地版本文件失败")
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("解析本地版本文件失败：{}", path.display()))
     }
 
     /// Merge a version with its inheritance chain.
@@ -377,7 +380,12 @@ pub fn expand_arguments(
         match value {
             ArgumentValue::Text(text) => out.push(substitute(text, variables)?),
             ArgumentValue::Conditional { rules, value } => {
-                if crate::rules::rules_allow(rules.as_deref(), platform, &env.features, env.os_known) {
+                if crate::rules::rules_allow(
+                    rules.as_deref(),
+                    platform,
+                    &env.features,
+                    env.os_known,
+                ) {
                     match value {
                         ArgumentText::One(text) => out.push(substitute(text, variables)?),
                         ArgumentText::Many(items) => {
@@ -692,7 +700,10 @@ mod tests {
             VersionKind::Snapshot
         );
         assert_eq!(classify_version("b1.8.1", "old_beta"), VersionKind::OldBeta);
-        assert_eq!(classify_version("a1.2.6", "old_alpha"), VersionKind::OldAlpha);
+        assert_eq!(
+            classify_version("a1.2.6", "old_alpha"),
+            VersionKind::OldAlpha
+        );
         // April Fools releases are plain snapshots upstream.
         assert_eq!(
             classify_version("24w14potato", "snapshot"),
