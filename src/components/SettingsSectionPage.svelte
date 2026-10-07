@@ -6,7 +6,7 @@
   import { app, ui, type SettingsSection } from '../lib/state.svelte';
   import { settingsTitle } from '../lib/settings';
   import { BMCLAPI_URL } from '../lib/downloads';
-  import { chooseTheme, installJava, openAccounts, refreshAccount, rescanJava, resetSettingsDraft, saveSettings } from '../lib/actions';
+  import { chooseTheme, goAccounts, installJava, refreshAccount, rescanJava, resetSettingsDraft, saveSettings } from '../lib/actions';
   import { formatDateTime, needsRefresh } from '../types/api';
   import Breadcrumb from './Breadcrumb.svelte';
 
@@ -97,7 +97,7 @@
         {/each}
       {/if}
       <div class="detail-actions wrap">
-        <button class="button ghost" onclick={openAccounts}>管理角色</button>
+        <button class="button ghost" onclick={goAccounts}>管理角色</button>
         {#each app.data.accounts.filter((account) => account.kind === 'microsoft') as account (account.id)}
           <button class="button ghost" onclick={() => refreshAccount(account)}>
             <RefreshCw size={15}/>刷新 {account.name}

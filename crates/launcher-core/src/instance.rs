@@ -218,6 +218,8 @@ impl crate::LauncherCore {
             dir.clone(),
             dir.join(".minecraft"),
             dir.join(".minecraft").join("mods"),
+            dir.join(".minecraft").join("shaderpacks"),
+            dir.join(".minecraft").join("schematics"),
             dir.join(".minecraft").join("config"),
             dir.join("natives"),
             dir.join("logs"),
@@ -258,22 +260,22 @@ impl crate::LauncherCore {
         Ok(())
     }
 
-    /// Mods folder of an instance: inside its imported game directory when it has
-    /// one, otherwise inside the launcher-managed `.minecraft`.
-    pub fn mods_dir(&self, instance: &Instance) -> PathBuf {
-        self.game_dir(instance).join("mods")
+    /// Resolve one managed resource folder inside the instance game directory.
+    pub fn resource_dir(&self, instance: &Instance, kind: ResourceKind) -> PathBuf {
+        self.game_dir(instance).join(kind.directory())
     }
 
-    /// Same, by instance id, for callers that only carry an id around.
-    pub async fn ensure_mods_dir(&self, id: &str) -> Result<PathBuf> {
-        let dir = self.mods_dir(&self.instance(id).await?);
+    pub async fn ensure_resource_dir(&self, id: &str, kind: ResourceKind) -> Result<PathBuf> {
+        let dir = self.resource_dir(&self.instance(id).await?, kind);
         tokio::fs::create_dir_all(&dir).await?;
         Ok(dir)
     }
 
-    /// List local mods with their enabled state, sorted by name.
-    pub async fn list_mods(&self, id: &str) -> Result<Vec<ModEntry>> {
-        let dir = self.ensure_mods_dir(id).await?;
+    /// List files for one resource type. Disabled files keep the same extension
+    /// followed by `.disabled`, so the game will ignore them while the UI can
+    /// restore them with one click.
+    pub async fn list_resources(&self, id: &str, kind: ResourceKind) -> Result<Vec<ResourceEntry>> {
+        let dir = self.ensure_resource_dir(id, kind).await?;
         let mut out = Vec::new();
         let mut entries = tokio::fs::read_dir(&dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -281,58 +283,60 @@ impl crate::LauncherCore {
                 continue;
             }
             let file_name = entry.file_name().to_string_lossy().to_string();
-            let enabled = file_name.ends_with(".jar");
-            let is_mod = enabled || file_name.ends_with(".jar.disabled");
-            if !is_mod {
+            let (base_name, enabled) = resource_base_name(&file_name);
+            if !kind.accepts(base_name) {
                 continue;
             }
             let metadata = entry.metadata().await?;
-            out.push(ModEntry {
+            out.push(ResourceEntry {
                 file_name: file_name.clone(),
                 enabled,
                 size: metadata.len(),
                 modified: metadata.modified().ok().map(chrono::DateTime::<Utc>::from),
-                display_name: file_name
-                    .trim_end_matches(".disabled")
-                    .trim_end_matches(".jar")
-                    .to_string(),
+                display_name: resource_display_name(base_name),
             });
         }
         out.sort_by(|left, right| left.display_name.cmp(&right.display_name));
         Ok(out)
     }
 
-    /// Copy a mod file into the instance's mods directory.
-    pub async fn add_mod(&self, id: &str, source: &Path) -> Result<String> {
+    pub async fn add_resource(
+        &self,
+        id: &str,
+        kind: ResourceKind,
+        source: &Path,
+    ) -> Result<String> {
         if !source.is_file() {
-            bail!("找不到模组文件：{}", source.display());
+            bail!("找不到{}文件：{}", kind.label(), source.display());
         }
         let file_name = source
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
-            .ok_or_else(|| anyhow!("模组文件名无效"))?;
-        if !file_name.to_lowercase().ends_with(".jar") {
-            bail!("只支持添加 .jar 模组文件");
+            .ok_or_else(|| anyhow!("{}文件名无效", kind.label()))?;
+        if !kind.accepts(&file_name) {
+            bail!("{}文件格式不受支持", kind.label());
         }
-        let dir = self.ensure_mods_dir(id).await?;
+        let dir = self.ensure_resource_dir(id, kind).await?;
         let destination = dir.join(&file_name);
         if destination.exists() {
-            bail!("模组目录中已经有 {file_name}");
+            bail!("{}目录中已经有 {file_name}", kind.label());
         }
         tokio::fs::copy(source, &destination).await?;
         Ok(file_name)
     }
 
-    /// Toggle a mod by renaming between `.jar` and `.jar.disabled`.
-    ///
-    /// The caller may pass either the plain file name or the stored name that
-    /// still carries the `.disabled` suffix.
-    pub async fn toggle_mod(&self, id: &str, file_name: &str, enabled: bool) -> Result<String> {
-        let dir = self.ensure_mods_dir(id).await?;
+    pub async fn toggle_resource(
+        &self,
+        id: &str,
+        kind: ResourceKind,
+        file_name: &str,
+        enabled: bool,
+    ) -> Result<String> {
+        let dir = self.ensure_resource_dir(id, kind).await?;
         validate_file_name(file_name)?;
-        let base = file_name.trim_end_matches(".disabled");
-        if base.is_empty() || !base.ends_with(".jar") {
-            bail!("只能启用或停用 .jar 模组文件");
+        let base = resource_base_name(file_name).0;
+        if base.is_empty() || !kind.accepts(base) {
+            bail!("只能启用或停用有效的{}文件", kind.label());
         }
         let (from, to) = if enabled {
             (dir.join(format!("{base}.disabled")), dir.join(base))
@@ -341,13 +345,12 @@ impl crate::LauncherCore {
         };
         if !from.is_file() {
             if to.is_file() {
-                // Already in the requested state: nothing to do.
                 return Ok(to
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default());
             }
-            bail!("找不到模组文件：{}", from.display());
+            bail!("找不到{}文件：{}", kind.label(), from.display());
         }
         tokio::fs::rename(&from, &to).await?;
         Ok(to
@@ -356,20 +359,99 @@ impl crate::LauncherCore {
             .unwrap_or_default())
     }
 
-    pub async fn delete_mod(&self, id: &str, file_name: &str) -> Result<()> {
-        let dir = self.ensure_mods_dir(id).await?;
+    pub async fn delete_resource(
+        &self,
+        id: &str,
+        kind: ResourceKind,
+        file_name: &str,
+    ) -> Result<()> {
+        let dir = self.ensure_resource_dir(id, kind).await?;
         validate_file_name(file_name)?;
         let path = dir.join(file_name);
         if !path.is_file() {
-            bail!("找不到模组文件：{}", path.display());
+            bail!("找不到{}文件：{}", kind.label(), path.display());
         }
         tokio::fs::remove_file(path).await?;
         Ok(())
     }
+
+    // Compatibility helpers used by the existing CLI smoke example and callers.
+    pub fn mods_dir(&self, instance: &Instance) -> PathBuf {
+        self.resource_dir(instance, ResourceKind::Mods)
+    }
+
+    pub async fn ensure_mods_dir(&self, id: &str) -> Result<PathBuf> {
+        self.ensure_resource_dir(id, ResourceKind::Mods).await
+    }
+
+    pub async fn list_mods(&self, id: &str) -> Result<Vec<ModEntry>> {
+        self.list_resources(id, ResourceKind::Mods).await
+    }
+
+    pub async fn add_mod(&self, id: &str, source: &Path) -> Result<String> {
+        self.add_resource(id, ResourceKind::Mods, source).await
+    }
+
+    pub async fn toggle_mod(&self, id: &str, file_name: &str, enabled: bool) -> Result<String> {
+        self.toggle_resource(id, ResourceKind::Mods, file_name, enabled)
+            .await
+    }
+
+    pub async fn delete_mod(&self, id: &str, file_name: &str) -> Result<()> {
+        self.delete_resource(id, ResourceKind::Mods, file_name)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Mods,
+    Shaders,
+    Projections,
+}
+
+impl ResourceKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "mods" => Ok(Self::Mods),
+            "shaders" => Ok(Self::Shaders),
+            "projections" => Ok(Self::Projections),
+            _ => bail!("未知资源类型：{value}"),
+        }
+    }
+
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Mods => "mods",
+            Self::Shaders => "shaderpacks",
+            Self::Projections => "schematics",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mods => "模组",
+            Self::Shaders => "光影",
+            Self::Projections => "投影",
+        }
+    }
+
+    fn accepts(self, file_name: &str) -> bool {
+        let lower = file_name.to_ascii_lowercase();
+        match self {
+            Self::Mods => lower.ends_with(".jar"),
+            Self::Shaders => lower.ends_with(".zip") || lower.ends_with(".jar"),
+            Self::Projections => {
+                lower.ends_with(".litematic")
+                    || lower.ends_with(".schematic")
+                    || lower.ends_with(".schem")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ModEntry {
+pub struct ResourceEntry {
     pub file_name: String,
     pub display_name: String,
     pub enabled: bool,
@@ -377,6 +459,23 @@ pub struct ModEntry {
     pub modified: Option<chrono::DateTime<Utc>>,
 }
 
+pub type ModEntry = ResourceEntry;
+
+fn resource_base_name(file_name: &str) -> (&str, bool) {
+    if file_name.to_ascii_lowercase().ends_with(".disabled") {
+        (&file_name[..file_name.len() - ".disabled".len()], false)
+    } else {
+        (file_name, true)
+    }
+}
+
+fn resource_display_name(file_name: &str) -> String {
+    file_name
+        .rsplit_once('.')
+        .map(|(name, _)| name)
+        .unwrap_or(file_name)
+        .to_string()
+}
 fn validate_file_name(file_name: &str) -> Result<()> {
     if file_name.is_empty()
         || file_name.contains('/')
@@ -391,6 +490,35 @@ fn validate_file_name(file_name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_kinds_use_expected_directories_and_extensions() {
+        assert_eq!(ResourceKind::parse("mods").unwrap().directory(), "mods");
+        assert_eq!(
+            ResourceKind::parse("shaders").unwrap().directory(),
+            "shaderpacks"
+        );
+        assert_eq!(
+            ResourceKind::parse("projections").unwrap().directory(),
+            "schematics"
+        );
+        assert!(ResourceKind::Mods.accepts("create.jar"));
+        assert!(ResourceKind::Shaders.accepts("complementary.ZIP"));
+        assert!(ResourceKind::Projections.accepts("base.litematic"));
+        assert!(!ResourceKind::Projections.accepts("base.jar"));
+        assert!(ResourceKind::parse("unknown").is_err());
+    }
+
+    #[test]
+    fn resource_names_keep_disabled_state_and_strip_only_extension() {
+        assert_eq!(resource_base_name("create.jar"), ("create.jar", true));
+        assert_eq!(
+            resource_base_name("create.jar.disabled"),
+            ("create.jar", false)
+        );
+        assert_eq!(resource_display_name("my-shader.zip"), "my-shader");
+        assert_eq!(resource_display_name("city.schematic"), "city");
+    }
 
     #[test]
     fn offline_uuid_is_stable_and_versioned() {

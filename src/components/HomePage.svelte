@@ -6,7 +6,7 @@
   import { loaderColors, loaderLabels, formatPlayed, isImported, shortPath } from '../types/api';
   import {
     activeAccount, goImport, goInstances, goVersions, goWizard, installInstance, launchSelected,
-    selectInstance, stopSelected
+    openInstance, selectInstance, stopSelected
   } from '../lib/actions';
 
   const account = $derived(activeAccount());
@@ -18,8 +18,7 @@
   const launching = $derived(Boolean(recent && app.launchingId === recent.id));
 
   async function openRecent(id: string) {
-    await goInstances();
-    await selectInstance(id);
+    await openInstance(id);
   }
 </script>
 

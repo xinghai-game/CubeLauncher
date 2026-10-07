@@ -1,12 +1,12 @@
 import type {
-  Bootstrap, GameDirScan, Instance, JavaRequirement, LaunchPreview, Loader, ModEntry, Settings,
+  Bootstrap, GameDirScan, Instance, JavaRequirement, LaunchPreview, Loader, ResourceEntry, Settings,
   Task, VersionCatalog
 } from '../types/api';
 import type { KindFilter } from './versions';
 import { applyTheme, readCachedTheme } from './theme';
 import { downloadSourceDraft } from './downloads';
 
-export type DetailTab = 'overview' | 'mods' | 'logs';
+export type DetailTab = 'overview' | 'mods' | 'shaders' | 'projections' | 'logs';
 export type SettingsSection = 'general' | 'account' | 'download' | 'java' | 'appearance' | 'about';
 
 /**
@@ -16,7 +16,10 @@ export type SettingsSection = 'general' | 'account' | 'download' | 'java' | 'app
  */
 export type Route =
   | { name: 'home' }
+  | { name: 'accounts' }
+  | { name: 'account'; accountId: string }
   | { name: 'instances'; tab: DetailTab }
+  | { name: 'instance'; instanceId: string; tab: DetailTab }
   | { name: 'versions'; kind: KindFilter; query: string }
   | { name: 'wizard'; version: string; step: 1 | 2 | 3 }
   | { name: 'install'; instanceId: string }
@@ -62,7 +65,8 @@ export const app = $state({
   launchingId: null as string | null,
   liveLogs: [] as string[],
   fileLogs: [] as string[],
-  mods: [] as ModEntry[],
+  resourceEntries: [] as ResourceEntry[],
+  resourceLoading: false,
   preview: null as LaunchPreview | null,
   /** Skin heads already fetched, keyed by account id (data URLs, per session). */
   skins: {} as Record<string, string>,
@@ -100,6 +104,8 @@ export const ui = $state({
   visibleVersions: 60,
   showAccount: false,
   showDeleteConfirm: false,
+  /** Which account the user chose when no instance is selected. */
+  accountSelectionId: null as string | null,
   /** Which half of the account dialog is showing. */
   accountTab: 'microsoft' as 'microsoft' | 'offline',
   accountName: '',

@@ -77,7 +77,7 @@ vi.mock('@tauri-apps/plugin-opener', () => ({
 }));
 
 import { app, emptySettings, idleLogin, ui } from '../src/lib/state.svelte';
-import { openAccounts } from '../src/lib/actions';
+import { activeAccount, openAccounts } from '../src/lib/actions';
 import AccountModal from '../src/components/AccountModal.svelte';
 
 function mountModal() {
@@ -119,6 +119,7 @@ describe('account dialog', { timeout: 20000 }, () => {
     ui.showAccount = true;
     ui.accountTab = 'microsoft';
     ui.accountName = '';
+    ui.accountSelectionId = null;
     ui.login = { ...idleLogin };
     ui.toast = '';
   });
@@ -191,5 +192,39 @@ describe('account dialog', { timeout: 20000 }, () => {
     expect(added?.args).toEqual({ name: 'Alice' });
     expect(app.data.accounts.map((account) => account.name)).toEqual(['Alice']);
     expect(ui.toast).toContain('已添加离线角色 Alice');
+  });
+
+  it('filters roles and requires confirmation before deletion', async () => {
+    app.data.accounts = [STEVE, ALICE];
+    const host = mountModal();
+    expect(host.querySelectorAll('.account-entry')).toHaveLength(2);
+
+    await type(host.querySelector('input[aria-label="搜索角色"]') as HTMLInputElement, 'Alice');
+    expect(host.querySelectorAll('.account-entry')).toHaveLength(1);
+    const accountList = host.querySelector('.account-list') as HTMLElement;
+    expect(accountList.textContent).toContain('Alice');
+    expect(accountList.textContent).not.toContain('Steve');
+
+    const deleteButton = [...host.querySelectorAll('button')]
+      .find((node) => node.getAttribute('title') === '删除角色') as HTMLButtonElement;
+    await click(deleteButton);
+    expect(host.textContent).toContain('确认删除 Alice');
+    expect(invocations.map((call) => call.command)).not.toContain('delete_account');
+
+    await click(button(host, '确认删除'));
+    expect(invocations.map((call) => call.command)).toContain('delete_account');
+    expect(app.data.accounts.map((account) => account.name)).toEqual(['Steve']);
+  });
+
+  it('keeps a chosen role active when no instance is selected', async () => {
+    app.data.accounts = [STEVE, ALICE];
+    ui.selectedId = null;
+    const host = mountModal();
+    const alice = [...host.querySelectorAll('button')]
+      .find((node) => node.getAttribute('title') === '使用 Alice') as HTMLButtonElement;
+
+    await click(alice);
+    expect(ui.accountSelectionId).toBe(ALICE.id);
+    expect(activeAccount()?.id).toBe(ALICE.id);
   });
 });

@@ -23,7 +23,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(async () => null) }));
 vi.mock('@tauri-apps/plugin-opener', () => ({ openPath: vi.fn(async () => {}) }));
 
 import { app, emptySettings, ui } from '../src/lib/state.svelte';
-import InstancesPage from '../src/components/InstancesPage.svelte';
+import InstancePage from '../src/components/InstancePage.svelte';
 
 const instance = (overrides: Partial<Instance> = {}): Instance => ({
   id: 'alice', name: '原版存档', game_version: '1.20.1', loader: 'vanilla',
@@ -53,11 +53,11 @@ function mountPage(task: Task | null = null, startingId: string | null = null) {
   app.installCancellingId = null;
   app.verifyingId = null;
   app.launchingId = null;
-  ui.route = { name: 'instances', tab: 'overview' };
+  ui.route = { name: 'instance', instanceId: 'alice', tab: 'overview' };
   ui.history = [];
   const host = document.createElement('div');
   document.body.appendChild(host);
-  mount(InstancesPage, { target: host });
+  mount(InstancePage, { target: host });
   flushSync();
   return host;
 }
@@ -123,7 +123,7 @@ describe('instance action buttons', { timeout: 20000 }, () => {
 
   it('starts an install on a repair click and leaves the page only then', async () => {
     const host = mountPage();
-    expect(ui.route.name).toBe('instances');
+    expect(ui.route.name).toBe('instance');
 
     await click(button(host, '修复/更新'));
     expect(invocations.map((call) => call.command)).toContain('install_instance');

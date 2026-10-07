@@ -5,7 +5,10 @@
   import TitleBar from './components/TitleBar.svelte';
   import Sidebar from './components/Sidebar.svelte';
   import HomePage from './components/HomePage.svelte';
+  import AccountsPage from './components/AccountsPage.svelte';
+  import AccountPage from './components/AccountPage.svelte';
   import InstancesPage from './components/InstancesPage.svelte';
+  import InstancePage from './components/InstancePage.svelte';
   import VersionCatalogPage from './components/VersionCatalogPage.svelte';
   import InstallWizard from './components/InstallWizard.svelte';
   import InstallProgressPage from './components/InstallProgressPage.svelte';
@@ -42,8 +45,14 @@
       <div class="page">
         {#if ui.route.name === 'home'}
           <HomePage />
+        {:else if ui.route.name === 'accounts'}
+          <AccountsPage />
+        {:else if ui.route.name === 'account'}
+          <AccountPage />
         {:else if ui.route.name === 'instances'}
           <InstancesPage />
+        {:else if ui.route.name === 'instance'}
+          <InstancePage />
         {:else if ui.route.name === 'versions'}
           <VersionCatalogPage />
         {:else if ui.route.name === 'wizard'}

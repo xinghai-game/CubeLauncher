@@ -173,13 +173,18 @@ export type Task = {
 
 export type LogLine = { stream: string; line: string; timestamp: string };
 
-export type ModEntry = {
+export type ResourceKind = 'mods' | 'shaders' | 'projections';
+
+export type ResourceEntry = {
   file_name: string;
   display_name: string;
   enabled: boolean;
   size: number;
   modified?: string | null;
 };
+
+/** ModEntry remains as a compatibility alias for older callers. */
+export type ModEntry = ResourceEntry;
 
 export type Bootstrap = {
   settings: Settings;

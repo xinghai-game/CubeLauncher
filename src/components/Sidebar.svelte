@@ -1,17 +1,17 @@
 <script lang="ts">
   import { ChevronDown, CloudOff, Download, House, Library, Settings as SettingsIcon, ShieldCheck, Zap } from 'lucide-svelte';
   import { app, ui } from '../lib/state.svelte';
-  import { activeAccount, goHome, goInstances, goSettings, goVersions, openAccounts } from '../lib/actions';
+  import { activeAccount, goAccounts, goHome, goInstances, goSettings, goVersions } from '../lib/actions';
   import { skinHeadStyle } from '../types/api';
 
   const account = $derived(activeAccount());
   // Deeper pages keep their parent highlighted, like HMCL's nested navigation.
   const onVersions = $derived(['versions', 'wizard', 'install'].includes(ui.route.name));
-  const onInstances = $derived(['instances', 'import'].includes(ui.route.name));
+  const onInstances = $derived(['instances', 'instance', 'import'].includes(ui.route.name));
 </script>
 
 <aside class="sidebar">
-  <button class="profile-card" onclick={openAccounts}>
+  <button class="profile-card" onclick={goAccounts}>
     {#if account && app.skins[account.id]}
       <span class="skin-head" style={skinHeadStyle(app.skins[account.id])}></span>
     {:else}

@@ -3,7 +3,7 @@
 //! never blocks and never needs filesystem or process permissions of its own.
 
 use launcher_core::auth::MicrosoftAuth;
-use launcher_core::instance::ModEntry;
+use launcher_core::instance::{ModEntry, ResourceEntry, ResourceKind};
 use launcher_core::{
     Account, AppSettings, DeviceCodePrompt, GameDirScan, InstallTask, Instance, JavaRequirement,
     JavaRuntime, LaunchPreview, LauncherCore, Loader, LogLine, LoginPoll, Progress, VersionCatalog,
@@ -711,6 +711,102 @@ async fn mods_dir(state: State<'_, AppState>, instance_id: String) -> Result<Str
 }
 
 #[tauri::command]
+async fn list_resources(
+    state: State<'_, AppState>,
+    instance_id: String,
+    kind: String,
+) -> Result<Vec<ResourceEntry>, String> {
+    let kind = ResourceKind::parse(&kind).map_err(err)?;
+    state
+        .read()
+        .await
+        .list_resources(&instance_id, kind)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+async fn add_resource(
+    state: State<'_, AppState>,
+    instance_id: String,
+    kind: String,
+    path: String,
+) -> Result<CommandResult, String> {
+    let kind = ResourceKind::parse(&kind).map_err(err)?;
+    let name = state
+        .read()
+        .await
+        .add_resource(&instance_id, kind, Path::new(&path))
+        .await
+        .map_err(err)?;
+    Ok(CommandResult {
+        ok: true,
+        message: format!("已添加 {name}"),
+    })
+}
+
+#[tauri::command]
+async fn toggle_resource(
+    state: State<'_, AppState>,
+    instance_id: String,
+    kind: String,
+    file_name: String,
+    enabled: bool,
+) -> Result<CommandResult, String> {
+    let kind = ResourceKind::parse(&kind).map_err(err)?;
+    state
+        .read()
+        .await
+        .toggle_resource(&instance_id, kind, &file_name, enabled)
+        .await
+        .map_err(err)?;
+    Ok(CommandResult {
+        ok: true,
+        message: if enabled {
+            "资源已启用".into()
+        } else {
+            "资源已停用".into()
+        },
+    })
+}
+
+#[tauri::command]
+async fn delete_resource(
+    state: State<'_, AppState>,
+    instance_id: String,
+    kind: String,
+    file_name: String,
+) -> Result<CommandResult, String> {
+    let kind = ResourceKind::parse(&kind).map_err(err)?;
+    state
+        .read()
+        .await
+        .delete_resource(&instance_id, kind, &file_name)
+        .await
+        .map_err(err)?;
+    Ok(CommandResult {
+        ok: true,
+        message: "资源已删除".into(),
+    })
+}
+
+#[tauri::command]
+async fn resource_dir(
+    state: State<'_, AppState>,
+    instance_id: String,
+    kind: String,
+) -> Result<String, String> {
+    let kind = ResourceKind::parse(&kind).map_err(err)?;
+    state
+        .read()
+        .await
+        .ensure_resource_dir(&instance_id, kind)
+        .await
+        .map_err(err)
+        .map(|path| path.display().to_string())
+}
+
+#[tauri::command]
 async fn instance_dir(state: State<'_, AppState>, instance_id: String) -> Result<String, String> {
     Ok(state
         .read()
@@ -926,6 +1022,11 @@ pub fn run() {
             toggle_mod,
             delete_mod,
             mods_dir,
+            list_resources,
+            add_resource,
+            toggle_resource,
+            delete_resource,
+            resource_dir,
             instance_dir,
             game_dir,
             scan_game_dir,

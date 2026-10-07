@@ -7,7 +7,7 @@
     activeDownloads, downloadHeadline, filePercent, fileName, installationState, taskPercent
   } from '../lib/install';
   import Breadcrumb from './Breadcrumb.svelte';
-  import { cancelInstall, goHome, goInstances, installInstance, launchSelected, selectInstance } from '../lib/actions';
+  import { cancelInstall, goHome, installInstance, launchSelected, openInstance as openInstancePage } from '../lib/actions';
 
   const instanceId = $derived(ui.route.name === 'install' ? ui.route.instanceId : '');
   const instance = $derived(app.data.instances.find((item) => item.id === instanceId) ?? null);
@@ -36,8 +36,7 @@
   });
 
   async function openInstance() {
-    await goInstances();
-    if (instanceId) await selectInstance(instanceId);
+    if (instanceId) await openInstancePage(instanceId);
   }
 
   async function launchNow() {
@@ -49,7 +48,7 @@
 <Breadcrumb
   items={[
     { label: '实例', to: { name: 'instances', tab: 'overview' } },
-    { label: instance?.name ?? '未知实例', to: { name: 'instances', tab: 'overview' } },
+    { label: instance?.name ?? '未知实例', to: { name: 'instance', instanceId, tab: 'overview' } },
     { label: '安装' }
   ]}
 />

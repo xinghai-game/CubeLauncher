@@ -3,8 +3,8 @@ import { openPath, openUrl } from '@tauri-apps/plugin-opener';
 import {
   invoke, isTauri, subscribe,
   type Account, type Bootstrap, type DeviceCodePrompt, type GameDirScan, type Instance,
-  type JavaRequirement, type LaunchPreview, type Loader, type LoginStatus, type ModEntry,
-  type Runtime, type Task, type VersionCatalog
+  type JavaRequirement, type LaunchPreview, type Loader, type LoginStatus, type ResourceEntry,
+  type ResourceKind, type Runtime, type Task, type VersionCatalog
 } from '../types/api';
 import {
   app, idleLogin, loaderKey, resetImportFlow, resetWizardForm, ui, type DetailTab, type Route,
@@ -59,8 +59,27 @@ export function goHome() {
   reset({ name: 'home' });
 }
 
+export function goAccounts() {
+  reset({ name: 'accounts' });
+}
+
+export function openAccount(id: string) {
+  ui.showAccount = false;
+  const account = app.data.accounts.find((item) => item.id === id);
+  if (account) void loadSkin(account);
+  go({ name: 'account', accountId: id });
+}
+
 export function goInstances(tab: DetailTab = 'overview') {
+  ui.detailTab = tab;
   reset({ name: 'instances', tab });
+}
+
+/** Open one instance as its own page, preserving the selected resource tab. */
+export async function openInstance(id: string, tab: DetailTab = 'overview') {
+  ui.detailTab = tab;
+  await selectInstance(id);
+  go({ name: 'instance', instanceId: id, tab });
 }
 
 export function goSettings(section: SettingsSection | null = null) {
@@ -132,6 +151,9 @@ export async function refreshAll() {
   try {
     const next = await invoke<Bootstrap>('bootstrap');
     app.data = next;
+    if (ui.accountSelectionId && !next.accounts.some((item) => item.id === ui.accountSelectionId)) {
+      ui.accountSelectionId = null;
+    }
     if (ui.selectedId && !next.instances.some((item) => item.id === ui.selectedId)) {
       ui.selectedId = next.instances[0]?.id ?? null;
     }
@@ -200,26 +222,38 @@ export async function loadLoaderVersions(gameVersion: string, loader: Loader, fo
 export function activeAccount(): Account | null {
   const selected = app.data.instances.find((item) => item.id === ui.selectedId) ?? null;
   return app.data.accounts.find((item) => item.id === selected?.account_id)
+    ?? app.data.accounts.find((item) => item.id === ui.accountSelectionId)
     ?? app.data.accounts[0]
     ?? null;
 }
 
+export function isResourceTab(tab: DetailTab): tab is ResourceKind {
+  return tab === 'mods' || tab === 'shaders' || tab === 'projections';
+}
+
+let resourceRequest = 0;
+
 export async function selectInstance(id: string) {
   ui.selectedId = id;
+  resourceRequest += 1;
+  app.resourceLoading = false;
   const instance = app.data.instances.find((item) => item.id === id) ?? null;
   ui.instanceDraft = instance ? { ...instance } : null;
   app.preview = null;
   app.liveLogs = [];
-  app.mods = [];
+  app.resourceEntries = [];
   app.fileLogs = [];
   if (!instance) return;
-  if (ui.detailTab === 'mods') await loadMods();
+  if (isResourceTab(ui.detailTab)) await loadResources(ui.detailTab);
   if (ui.detailTab === 'logs') await loadFileLogs();
 }
 
 export async function setDetailTab(tab: DetailTab) {
   ui.detailTab = tab;
-  if (tab === 'mods') await loadMods();
+  resourceRequest += 1;
+  app.resourceLoading = false;
+  if (ui.route.name === 'instance') ui.route = { ...ui.route, tab };
+  if (isResourceTab(tab)) await loadResources(tab);
   if (tab === 'logs') await loadFileLogs();
 }
 
@@ -392,11 +426,21 @@ export async function refreshAccount(account: Account) {
 }
 
 export async function chooseAccount(account: Account) {
+  ui.accountSelectionId = account.id;
   const selected = app.data.instances.find((item) => item.id === ui.selectedId) ?? null;
   if (!selected || !ui.instanceDraft) { notify(`已选择 ${account.name}`); return; }
   ui.instanceDraft = { ...ui.instanceDraft, account_id: account.id };
   await saveInstanceDraft();
   notify(`已为 ${selected.name} 选择 ${account.name}`);
+}
+
+export async function copyAccountUuid(account: Account) {
+  try {
+    await navigator.clipboard.writeText(account.uuid);
+    notify(`已复制 ${account.name} 的 UUID`);
+  } catch {
+    notify('无法访问剪贴板，请手动复制 UUID', true);
+  }
 }
 
 export async function removeAccount(account: Account) {
@@ -406,6 +450,7 @@ export async function removeAccount(account: Account) {
     const skins = { ...app.skins };
     delete skins[account.id];
     app.skins = skins;
+    if (ui.accountSelectionId === account.id) ui.accountSelectionId = null;
     // The deleted account may have been the one the dialog was signing in as.
     if (ui.login.active) await cancelMicrosoftLogin();
     notify(`已删除角色 ${account.name}`);
@@ -589,48 +634,85 @@ export async function showPreview() {
   } catch (error) { app.preview = null; guard(error); }
 }
 
-/* -------------------------------------------------------------------- mods */
+/* ---------------------------------------------------------- instance resources */
 
-export async function loadMods() {
-  if (!ui.selectedId) return;
-  try { app.mods = await invoke<ModEntry[]>('list_mods', { instanceId: ui.selectedId }); }
-  catch (error) { guard(error); }
+const resourceLabels: Record<ResourceKind, string> = {
+  mods: '模组',
+  shaders: '光影',
+  projections: '投影'
+};
+
+const resourceFilters: Record<ResourceKind, { name: string; extensions: string[] }> = {
+  mods: { name: '模组', extensions: ['jar'] },
+  shaders: { name: '光影', extensions: ['zip', 'jar'] },
+  projections: { name: '投影文件', extensions: ['litematic', 'schematic', 'schem'] }
+};
+
+export async function loadResources(kind: ResourceKind = 'mods') {
+  const instanceId = ui.selectedId;
+  if (!instanceId) return;
+  const request = ++resourceRequest;
+  app.resourceLoading = true;
+  try {
+    const entries = await invoke<ResourceEntry[]>('list_resources', { instanceId, kind });
+    if (request === resourceRequest && ui.selectedId === instanceId) {
+      app.resourceEntries = entries;
+    }
+  } catch (error) { guard(error); }
+  finally {
+    if (request === resourceRequest) app.resourceLoading = false;
+  }
 }
 
-export async function addMod() {
+export async function addResource(kind: ResourceKind) {
   if (!ui.selectedId) return;
   if (!isTauri) { notify('浏览器预览模式无法选择文件', true); return; }
   try {
-    const picked = await openDialog({ multiple: true, filters: [{ name: '模组', extensions: ['jar'] }] });
+    const picked = await openDialog({ multiple: true, filters: [resourceFilters[kind]] });
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
-    for (const path of paths) await invoke('add_mod', { instanceId: ui.selectedId, path });
-    if (paths.length) notify(`已添加 ${paths.length} 个模组文件`);
-    await loadMods();
+    for (const path of paths) {
+      await invoke('add_resource', { instanceId: ui.selectedId, kind, path });
+    }
+    if (paths.length) notify(`已添加 ${paths.length} 个${resourceLabels[kind]}文件`);
+    await loadResources(kind);
   } catch (error) { guard(error); }
 }
 
-export async function toggleMod(mod: ModEntry) {
+export async function toggleResource(kind: ResourceKind, resource: ResourceEntry) {
   if (!ui.selectedId) return;
   try {
-    await invoke('toggle_mod', { instanceId: ui.selectedId, fileName: mod.file_name, enabled: !mod.enabled });
-    await loadMods();
+    await invoke('toggle_resource', {
+      instanceId: ui.selectedId, kind, fileName: resource.file_name, enabled: !resource.enabled
+    });
+    await loadResources(kind);
   } catch (error) { guard(error); }
 }
 
-export async function removeMod(mod: ModEntry) {
+export async function removeResource(kind: ResourceKind, resource: ResourceEntry) {
   if (!ui.selectedId) return;
   try {
-    await invoke('delete_mod', { instanceId: ui.selectedId, fileName: mod.file_name });
-    await loadMods();
-    notify(`已删除 ${mod.display_name}`);
+    await invoke('delete_resource', {
+      instanceId: ui.selectedId, kind, fileName: resource.file_name
+    });
+    await loadResources(kind);
+    notify(`已删除 ${resource.display_name}`);
   } catch (error) { guard(error); }
 }
 
-export async function openFolder(kind: 'instance' | 'mods' | 'game') {
+/** Compatibility wrappers for callers that still use the old Mod API. */
+export async function loadMods() { await loadResources('mods'); }
+export async function addMod() { await addResource('mods'); }
+export async function toggleMod(resource: ResourceEntry) { await toggleResource('mods', resource); }
+export async function removeMod(resource: ResourceEntry) { await removeResource('mods', resource); }
+
+export async function openFolder(kind: 'instance' | 'mods' | 'shaders' | 'projections' | 'game') {
   if (!ui.selectedId) return;
-  const command = kind === 'mods' ? 'mods_dir' : kind === 'game' ? 'game_dir' : 'instance_dir';
+  const command = kind === 'game' ? 'game_dir' : kind === 'instance' ? 'instance_dir' : 'resource_dir';
   try {
-    const path = await invoke<string>(command, { instanceId: ui.selectedId });
+    const args = command === 'resource_dir'
+      ? { instanceId: ui.selectedId, kind }
+      : { instanceId: ui.selectedId };
+    const path = await invoke<string>(command, args);
     if (isTauri) await openPath(path); else notify(path);
   } catch (error) { guard(error); }
 }
