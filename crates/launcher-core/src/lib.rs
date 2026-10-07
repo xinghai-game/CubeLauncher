@@ -82,7 +82,7 @@ pub struct LauncherCore {
     pub paths: CorePaths,
     pub settings: AppSettings,
     pub downloader: Downloader,
-    /// 正版 sign-in chain, rebuilt whenever the settings change the client id.
+    /// 正版 sign-in chain, always using the application id compiled into the launcher.
     pub auth: auth::MicrosoftAuth,
     pub processes: std::sync::Arc<launch::ProcessRegistry>,
 }
@@ -96,7 +96,7 @@ impl LauncherCore {
             settings.offline_mode,
             settings.mirror_base_url.clone(),
         )?;
-        let auth = auth::MicrosoftAuth::new(settings.microsoft_client_id.clone())?;
+        let auth = auth::MicrosoftAuth::new()?;
         Ok(Self {
             paths,
             settings,
@@ -148,7 +148,7 @@ impl LauncherCore {
             settings.offline_mode,
             settings.mirror_base_url.clone(),
         )?;
-        let auth = auth::MicrosoftAuth::new(settings.microsoft_client_id.clone())?;
+        let auth = auth::MicrosoftAuth::new()?;
         paths.ensure().await?;
         atomic_write(
             &paths.root.join("settings.json"),

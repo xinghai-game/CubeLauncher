@@ -123,20 +123,15 @@
     <section class="settings-card">
       <div class="settings-card-head">
         <span class="stat-icon purple"><ShieldCheck size={17}/></span>
-        <div><strong>Microsoft 应用 ID</strong><small>一般不需要修改</small></div>
+        <div><strong>Microsoft 登录</strong><small>设备代码授权</small></div>
       </div>
-      <label>自定义应用 ID
-        <input
-          placeholder="留空使用内置应用 ID"
-          value={draft.microsoft_client_id ?? ''}
-          oninput={(event) => (draft.microsoft_client_id = event.currentTarget.value)}
-        />
-      </label>
+      <div class="summary-row"><span>登录方式</span><strong>Microsoft 官方设备代码</strong></div>
+      <div class="summary-row"><span>应用配置</span><strong>由 CubeLauncher 固定提供</strong></div>
       <p class="help-text">
-        登录使用 Microsoft 的 OAuth 设备代码流，需要一个公开客户端应用 ID。留空时使用启动器内置的公共 ID；
-        如果你自己注册了应用，可以在这里填写（需开启“允许公共客户端流”）。
+        点击“使用 Microsoft 账户登录”后，浏览器页面可能显示“其他启动器”。这是微软登记的 OAuth 应用名称，
+        只要地址是 Microsoft 官方页面并且你确认是从 CubeLauncher 发起的，就按页面输入代码并同意授权。
       </p>
-      <p class="help-text">严格离线模式下不会发起登录或刷新请求。</p>
+      <p class="help-text">启动器不会接触 Microsoft 密码，令牌只保存在本机账户文件中。</p>
     </section>
   </div>
 

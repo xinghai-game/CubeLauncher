@@ -165,6 +165,7 @@
           <p class="help-text">
             用 Microsoft 账户登录即可使用正版身份：进入正版验证服务器、显示自己的皮肤与名称。
             启动器不会接触你的密码，也不会把令牌发给第三方：登录在 Microsoft 自己的页面上完成。
+            页面可能把授权应用显示为“其他启动器”，这是微软登记的应用名称；按页面输入代码并同意授权即可。
           </p>
           {#if login.error}<p class="help-text error-text">{login.error}</p>{/if}
           <button class="button primary" onclick={startMicrosoftLogin}><ShieldCheck size={16}/>使用 Microsoft 账户登录</button>

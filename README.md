@@ -142,8 +142,7 @@ Quilt、OptiFine、LiteLoader 等没有安装器的加载器会按“原版”�
 - 正版登录使用 OAuth 设备代码流：需要自己打开 `https://microsoft.com/link` 并输入启动器显示的代码，
   启动器不会接触密码；也可以直接点“使用 Microsoft 账户登录”让启动器代开浏览器。
   登录要求该 Microsoft 账户已购买 Minecraft Java 版，没有游戏档案时会明确报错（XSTS 的常见错误码会翻译成人话）。
-- 默认使用启动器内置的公共 Microsoft 应用 ID；如果你自己注册了应用（需允许公共客户端流），
-  可在“设置 → 账户与登录”里替换。该 ID 属于公共客户端，不涉及密钥。
+- 默认使用程序内固定的 Microsoft 公共应用 ID；正版登录采用设备代码流，浏览器授权页可能显示该应用在 Microsoft 中登记的名称“其他启动器”。
 - 登录令牌（Microsoft 刷新令牌与 Minecraft 访问令牌）以明文保存在数据目录的 `accounts.json`，
   Unix 下写入权限为 0600（有单测锁定）；删除角色即删除令牌。界面与 IPC 只拿到状态，不拿到令牌。
   长期凭证只有刷新令牌，且只会发给 Microsoft 与 Minecraft 官方接口，不会上传到第三方。

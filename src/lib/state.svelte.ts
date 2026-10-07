@@ -30,9 +30,7 @@ export type Route =
 export const emptySettings: Settings = {
   schema_version: 1, data_dir: 'CubeLauncher', theme: 'dark', locale: 'zh-CN',
   download_concurrency: 4, default_memory_mb: 4096, offline_mode: false,
-  mirror_base_url: null, java_mirror_base_url: null, close_launcher_after_launch: false,
-  // The draft keeps a string (inputs cannot bind to null); saving turns "" into null.
-  microsoft_client_id: ''
+  mirror_base_url: null, java_mirror_base_url: null, close_launcher_after_launch: false
 };
 
 const demo: Bootstrap = {

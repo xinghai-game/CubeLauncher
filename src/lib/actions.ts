@@ -875,9 +875,7 @@ export async function saveSettings() {
   try {
     const settings = normalizeDownloadSettings({
       ...ui.settingsDraft,
-      mirror_base_url: downloadMirrorUrl(ui.downloadSourceDraft),
-      // Blank means "use the built-in application id", which is `null`, not "".
-      microsoft_client_id: ui.settingsDraft.microsoft_client_id?.trim() || null
+      mirror_base_url: downloadMirrorUrl(ui.downloadSourceDraft)
     });
     app.data = await invoke<Bootstrap>('save_settings', { settings });
     ui.settingsDraft = { ...app.data.settings };

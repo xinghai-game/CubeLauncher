@@ -11,10 +11,8 @@ pub const ADOPTIUM_API: &str = "https://api.adoptium.net/v3";
 pub const RESOURCES_URL: &str = "https://resources.download.minecraft.net";
 pub const LAUNCHER_NAME: &str = "CubeLauncher";
 pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Application id used for the Microsoft sign-in. It is the well-known public
-/// client used by Minecraft launchers for the device code flow, so no secret is
-/// involved and nothing has to be registered to build this launcher. Users can
-/// point the launcher at their own Microsoft Entra application in the settings.
+/// Application id compiled into the launcher for Microsoft device-code sign-in.
+/// It is public OAuth metadata and does not contain a secret.
 pub const MICROSOFT_CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
 /// `offline_access` is what makes the sign-in survive a restart: it yields the
 /// refresh token the launcher stores instead of a password.
@@ -44,10 +42,6 @@ pub struct AppSettings {
     pub java_mirror_base_url: Option<String>,
     #[serde(default)]
     pub close_launcher_after_launch: bool,
-    /// Microsoft Entra application id used for 正版 sign-in. `None` means the
-    /// built-in public client id; setting it lets a fork use its own application.
-    #[serde(default)]
-    pub microsoft_client_id: Option<String>,
 }
 fn default_theme() -> String {
     "dark".into()
@@ -78,7 +72,6 @@ impl Default for AppSettings {
             mirror_base_url: None,
             java_mirror_base_url: None,
             close_launcher_after_launch: false,
-            microsoft_client_id: None,
         }
     }
 }

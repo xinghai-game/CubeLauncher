@@ -97,7 +97,7 @@ impl Stub {
     }
 
     fn auth(&self) -> MicrosoftAuth {
-        MicrosoftAuth::new(None)
+        MicrosoftAuth::new()
             .unwrap()
             .with_endpoints(self.endpoints())
     }
@@ -730,13 +730,8 @@ async fn skin_textures_come_back_as_png_data_urls() {
 }
 
 #[test]
-fn client_id_defaults_and_overrides_behave() {
-    assert_eq!(normalize_client_id(None), MICROSOFT_CLIENT_ID);
-    assert_eq!(normalize_client_id(Some("   ".into())), MICROSOFT_CLIENT_ID);
-    assert_eq!(
-        normalize_client_id(Some(" 11111111-2222-3333-4444-555555555555 ".into())),
-        "11111111-2222-3333-4444-555555555555"
-    );
+fn client_id_is_fixed_in_the_program() {
+    assert_eq!(MicrosoftAuth::new().unwrap().client_id(), MICROSOFT_CLIENT_ID);
 }
 
 #[test]

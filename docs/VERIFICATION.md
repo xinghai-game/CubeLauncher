@@ -460,7 +460,7 @@ cargo run -p launcher-core --example smoke -- refresh /tmp/cube-auth-probe Steve
 | 截图 | 内容 |
 | --- | --- |
 | `docs/screenshots/account-login.png` | 账户管理 → 正版登录：设备代码 `K7QP2-9XMTD`、打开链接与复制按钮、等待提示；下方角色列表带“正版/离线”徽标、官方皮肤头部与“登录有效至 …” |
-| `docs/screenshots/settings-account.png` | 设置 → 账户与登录：角色与令牌状态、令牌文件位置与 0600 权限、可替换的 Microsoft 应用 ID |
+| `docs/screenshots/settings-account.png` | 设置 → 账户与登录：角色与令牌状态、令牌文件位置与 0600 权限、固定的 Microsoft 登录配置 |
 
 ### 与离线身份并存的细节
 

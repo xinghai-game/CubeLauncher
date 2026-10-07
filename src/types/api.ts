@@ -116,8 +116,6 @@ export type Settings = {
   mirror_base_url?: string | null;
   java_mirror_base_url?: string | null;
   close_launcher_after_launch: boolean;
-  /** Microsoft Entra application id; `null` uses the built-in public client. */
-  microsoft_client_id?: string | null;
 };
 
 export type VersionKind = 'release' | 'snapshot' | 'old_beta' | 'old_alpha' | 'april_fools';

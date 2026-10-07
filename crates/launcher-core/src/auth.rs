@@ -61,13 +61,13 @@ impl Default for AuthEndpoints {
 #[derive(Clone)]
 pub struct MicrosoftAuth {
     client: reqwest::Client,
-    /// Application id used when the settings do not override it.
+    /// Application id compiled into CubeLauncher.
     client_id: String,
     endpoints: AuthEndpoints,
 }
 
 impl MicrosoftAuth {
-    pub fn new(client_id: Option<String>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(format!("{LAUNCHER_NAME}/{LAUNCHER_VERSION}"))
             .connect_timeout(StdDuration::from_secs(20))
@@ -75,7 +75,7 @@ impl MicrosoftAuth {
             .build()?;
         Ok(Self {
             client,
-            client_id: normalize_client_id(client_id),
+            client_id: MICROSOFT_CLIENT_ID.to_string(),
             endpoints: AuthEndpoints::default(),
         })
     }
@@ -553,14 +553,6 @@ pub fn session_for(account: &Account) -> AuthSession {
 /// name is enough here and stays stable across releases.
 pub fn launcher_client_id() -> String {
     crate::instance::offline_uuid(&format!("{LAUNCHER_NAME}:client"))
-}
-
-/// `None`, an empty string and whitespace all mean "use the built-in app id".
-pub fn normalize_client_id(value: Option<String>) -> String {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| MICROSOFT_CLIENT_ID.to_string())
 }
 
 /// Insert the dashes of the canonical UUID form. Mojang reports profile ids
