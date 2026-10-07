@@ -75,13 +75,16 @@ impl crate::LauncherCore {
     }
 
     async fn fetch_manifest(&self) -> Result<(Manifest, ManifestSource)> {
-        let bytes = self.downloader.fetch_bytes(MANIFEST_URL).await?;
+        let (bytes, mirrored) = self
+            .downloader
+            .fetch_bytes_with_source(MANIFEST_URL)
+            .await?;
         let manifest: Manifest = serde_json::from_slice(&bytes).context("解析版本清单失败")?;
         crate::atomic_write(&self.manifest_cache_path(), &bytes).await?;
-        let source = if self.downloader.map_url(MANIFEST_URL) == MANIFEST_URL {
-            ManifestSource::Official
-        } else {
+        let source = if mirrored {
             ManifestSource::Mirror
+        } else {
+            ManifestSource::Official
         };
         Ok((manifest, source))
     }
@@ -220,15 +223,46 @@ impl crate::LauncherCore {
             .with_context(|| format!("解析本地版本文件失败：{}", path.display()))
     }
 
+    /// Read a version document that is already on disk, preferring the extra
+    /// directories an imported `.minecraft` brings along. Falling back to the
+    /// launcher's own cache and then the network is what keeps an imported
+    /// installation launchable offline.
+    async fn version_meta_in(&self, local: &[PathBuf], id: &str) -> Result<VersionMeta> {
+        for root in local {
+            let path = root.join(id).join(format!("{id}.json"));
+            if let Ok(meta) = self.version_meta_from_path(&path).await {
+                return Ok(meta);
+            }
+        }
+        self.version_meta(id, false).await
+    }
+
     /// Merge a version with its inheritance chain.
     pub async fn resolve_version(&self, id: &str) -> Result<ResolvedVersion> {
-        let root = self.version_meta(id, false).await?;
-        self.resolve_from_meta(root, id.to_string()).await
+        self.resolve_version_in(&[], id).await
+    }
+
+    /// Merge a version with its inheritance chain, reading documents out of `local`
+    /// (an imported game directory) before the launcher's own metadata.
+    pub async fn resolve_version_in(&self, local: &[PathBuf], id: &str) -> Result<ResolvedVersion> {
+        let root = self.version_meta_in(local, id).await?;
+        self.resolve_from_meta_in(local, root, id.to_string()).await
     }
 
     /// Merge a version document that may inherit from official versions.
     pub async fn resolve_from_meta(
         &self,
+        entry: VersionMeta,
+        entry_id: String,
+    ) -> Result<ResolvedVersion> {
+        self.resolve_from_meta_in(&[], entry, entry_id).await
+    }
+
+    /// Merge a version document with its chain, resolving parents through `local`
+    /// first so an imported installation never needs the network to start.
+    pub async fn resolve_from_meta_in(
+        &self,
+        local: &[PathBuf],
         entry: VersionMeta,
         entry_id: String,
     ) -> Result<ResolvedVersion> {
@@ -244,7 +278,7 @@ impl crate::LauncherCore {
             if seen.len() > 16 {
                 bail!("版本继承层级过深：{}", seen.join(" -> "));
             }
-            let parent = self.version_meta(&parent_id, false).await?;
+            let parent = self.version_meta_in(local, &parent_id).await?;
             seen.push(parent_id.clone());
             chain.push((parent_id, parent));
         }

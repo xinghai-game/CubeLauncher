@@ -1,14 +1,16 @@
-use crate::types::{DownloadInfo, InstallTask, RESOURCES_URL};
-use anyhow::{anyhow, bail, Context, Result};
-use futures_util::StreamExt;
-use reqwest::header::RANGE;
+use crate::types::{ActiveDownload, DownloadInfo, InstallTask, RESOURCES_URL};
+use anyhow::{bail, Result};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc, Semaphore};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+
+mod engine;
+pub use engine::Downloader;
 
 /// A single file to place on disk, with whatever integrity data upstream provides.
 #[derive(Debug, Clone)]
@@ -99,6 +101,156 @@ pub fn verify_sync(path: &Path, sha1: Option<&str>, sha256: Option<&str>) -> Res
     Ok(true)
 }
 
+/// Mid-transfer updates are coalesced to this interval. Stage, step and terminal
+/// events are never throttled, so every finished file still reports.
+const REPORT_INTERVAL: Duration = Duration::from_millis(150);
+
+/// A file that is transferring right now.
+#[derive(Default)]
+struct ActiveFile {
+    name: String,
+    size: u64,
+    received: u64,
+}
+
+/// The phase the last stage/step event belonged to. Byte updates reuse it so the
+/// headline does not jump between a file name and a phase name.
+#[derive(Default, Clone)]
+struct Context {
+    phase: String,
+    message: String,
+}
+
+/// Byte-level accounting for the batch of files one phase transfers.
+///
+/// Settled files are already valid or finished; active files are in flight, so
+/// `done` is derived instead of repaired with signed deltas when a transfer
+/// restarts. Segment workers share one entry per destination.
+#[derive(Default)]
+struct Tracker {
+    total_bytes: AtomicU64,
+    settled_bytes: AtomicU64,
+    active: Mutex<BTreeMap<String, ActiveFile>>,
+    context: Mutex<Context>,
+    last_report: Mutex<Option<Instant>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+impl Tracker {
+    /// Start a fresh batch: known sizes are the denominator, and nothing of it
+    /// is on disk yet (satisfied files are settled as the caller checks them).
+    fn begin_batch(&self, items: &[DownloadItem]) {
+        let total: u64 = items.iter().filter_map(|item| item.size).sum();
+        self.total_bytes.store(total, Ordering::Relaxed);
+        self.settled_bytes.store(0, Ordering::Relaxed);
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *lock(&self.last_report) = None;
+    }
+    /// Count one known size that is not part of the batch total yet.
+    fn plan(&self, item: &DownloadItem) {
+        if let Some(size) = item.size {
+            self.total_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+    /// A file whose destination already validates counts as finished.
+    fn settle(&self, size: Option<u64>) {
+        if let Some(size) = size {
+            self.settled_bytes.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+    fn begin_file(&self, key: &str, name: String, size: Option<u64>) {
+        lock(&self.active).insert(
+            key.to_owned(),
+            ActiveFile {
+                name,
+                size: size.unwrap_or(0),
+                received: 0,
+            },
+        );
+    }
+    /// Absolute progress for one file, used where the engine learns how much of
+    /// a partial file it keeps.
+    fn credit_file(&self, key: &str, bytes: u64) {
+        if let Some(file) = lock(&self.active).get_mut(key) {
+            file.received = bytes;
+        }
+    }
+    fn add_bytes(&self, key: &str, bytes: u64) {
+        if let Some(file) = lock(&self.active).get_mut(key) {
+            file.received += bytes;
+        }
+    }
+    /// Stop listing a file. A finished file counts its full size even if some
+    /// bytes were never observed, so a completed batch reaches its total.
+    fn finish_file(&self, key: &str, complete: bool) -> bool {
+        let mut active = lock(&self.active);
+        if let Some(file) = active.remove(key) {
+            let counted = if complete {
+                file.received.max(file.size)
+            } else {
+                file.received
+            };
+            self.settled_bytes.fetch_add(counted, Ordering::Relaxed);
+        }
+        active.is_empty()
+    }
+    /// Forget every in-flight file: used when a phase ends, so a terminal event
+    /// never advertises transfers that have already stopped.
+    fn clear(&self) {
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.settled_bytes.store(0, Ordering::Relaxed);
+        lock(&self.active).clear();
+        *lock(&self.last_report) = None;
+    }
+    fn clear_active(&self) {
+        let mut active = lock(&self.active);
+        for file in active.values() {
+            self.settled_bytes
+                .fetch_add(file.received, Ordering::Relaxed);
+        }
+        active.clear();
+    }
+    fn set_context(&self, phase: &str, message: &str) {
+        let mut context = lock(&self.context);
+        context.phase = phase.to_owned();
+        context.message = message.to_owned();
+    }
+    fn context(&self) -> Context {
+        lock(&self.context).clone()
+    }
+    fn snapshot(&self) -> (u64, u64, Vec<ActiveDownload>) {
+        let active = lock(&self.active);
+        let mut files: Vec<ActiveDownload> = active
+            .values()
+            .map(|file| ActiveDownload {
+                name: file.name.clone(),
+                downloaded: file.received,
+                total: file.size,
+            })
+            .collect();
+        // Largest first: the files worth watching are the ones that take time.
+        files.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.name.cmp(&b.name)));
+        let downloaded = self.settled_bytes.load(Ordering::Relaxed)
+            + active.values().map(|file| file.received).sum::<u64>();
+        (downloaded, self.total_bytes.load(Ordering::Relaxed), files)
+    }
+    fn take_report_slot(&self) -> bool {
+        let mut last = lock(&self.last_report);
+        let now = Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < REPORT_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
 /// Progress channel wrapper shared by installers and downloaders.
 #[derive(Clone)]
 pub struct Progress {
@@ -108,6 +260,7 @@ pub struct Progress {
     pub cancel: Arc<AtomicBool>,
     done: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    tracker: Arc<Tracker>,
 }
 
 impl Progress {
@@ -119,6 +272,7 @@ impl Progress {
             cancel: Arc::new(AtomicBool::new(false)),
             done: Arc::new(AtomicU64::new(0)),
             total: Arc::new(AtomicU64::new(0)),
+            tracker: Arc::new(Tracker::default()),
         }
     }
     pub fn cancelled(&self) -> bool {
@@ -130,8 +284,12 @@ impl Progress {
         }
         Ok(())
     }
+    /// Counters describe the phase that follows; byte totals belong to the batch
+    /// the downloader is about to announce, so they start empty here.
     pub fn set_total(&self, total: u64) {
+        self.done.store(0, Ordering::Relaxed);
         self.total.store(total, Ordering::Relaxed);
+        self.tracker.clear();
     }
     pub async fn stage(&self, phase: &str, message: impl Into<String>) {
         self.send(phase, message.into(), false, None).await;
@@ -144,13 +302,87 @@ impl Progress {
             .await;
     }
     pub async fn finish(&self, message: impl Into<String>) {
+        self.tracker.clear_active();
         self.send("done", message.into(), true, None).await;
     }
     pub async fn fail(&self, message: impl Into<String>) {
+        self.tracker.clear_active();
         let message = message.into();
         self.send("error", message.clone(), true, Some(message))
             .await;
     }
+
+    /* ------------------------------------------------------- download batches */
+
+    /// Announce the files a batch will transfer, so the byte bar has a denominator
+    /// before the first response arrives.
+    pub fn begin_batch(&self, items: &[DownloadItem]) {
+        self.tracker.begin_batch(items);
+        self.report();
+    }
+    /// A batch that was never announced still reports bytes: the first file to
+    /// start claims the batch.
+    fn ensure_batch(&self, item: &DownloadItem) {
+        let (downloaded, total, active) = self.tracker.snapshot();
+        if downloaded == 0 && total == 0 && active.is_empty() {
+            self.tracker.plan(item);
+        }
+    }
+    /// A destination that already validates counts toward the byte total.
+    pub fn settle_satisfied(&self, item: &DownloadItem) {
+        self.tracker.settle(item.size);
+    }
+    pub fn begin_file(&self, item: &DownloadItem) {
+        self.ensure_batch(item);
+        self.tracker
+            .begin_file(&item_key(item), display_name(item), item.size);
+        self.report();
+    }
+    /// Bytes of a partial file that this run keeps and will not fetch again.
+    pub fn credit_file(&self, key: &str, bytes: u64) {
+        self.tracker.credit_file(key, bytes);
+        self.report();
+    }
+    pub fn add_bytes(&self, key: &str, bytes: u64) {
+        if bytes > 0 {
+            self.tracker.add_bytes(key, bytes);
+            self.report();
+        }
+    }
+    /// Stop listing a file. The last file of a batch reports immediately so the
+    /// bar lands on its total instead of the last throttled sample.
+    pub async fn finish_file(&self, key: &str, complete: bool) {
+        if self.tracker.finish_file(key, complete) {
+            self.send_context().await;
+        } else {
+            self.report();
+        }
+    }
+
+    /// One coalesced update while bytes are moving. Dropped when the channel is
+    /// full: a slow reader must never stall a transfer.
+    fn report(&self) {
+        let Some(tx) = &self.tx else { return };
+        if !self.tracker.take_report_slot() {
+            return;
+        }
+        let context = self.tracker.context();
+        let current = self.done.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        let _ =
+            tx.try_send(self.build(context.phase, context.message, current, total, false, None));
+    }
+    /// Unthrottled update that keeps the current stage headline.
+    async fn send_context(&self) {
+        let context = self.tracker.context();
+        let current = self.done.load(Ordering::Relaxed);
+        let total = self.total.load(Ordering::Relaxed);
+        self.send_counts_with(&context.phase, context.message, current, total, false, None)
+            .await;
+    }
+
+    /* ------------------------------------------------------------- reporting */
+
     async fn send(&self, phase: &str, message: String, done: bool, error: Option<String>) {
         let total = self.total.load(Ordering::Relaxed);
         let current = self.done.load(Ordering::Relaxed);
@@ -170,327 +402,54 @@ impl Progress {
         done: bool,
         error: Option<String>,
     ) {
+        self.tracker.set_context(phase, &message);
+        let task = self.build(phase.to_string(), message, current, total, done, error);
         if let Some(tx) = &self.tx {
-            let _ = tx
-                .send(InstallTask {
-                    id: self.task_id.clone(),
-                    instance_id: self.instance_id.clone(),
-                    phase: phase.to_string(),
-                    current,
-                    total,
-                    message,
-                    done,
-                    error,
-                })
-                .await;
+            let _ = tx.send(task).await;
         }
     }
-}
-
-/// Upstream host → path prefix on the mirror. Verified against BMCLAPI:
-/// version metadata keeps its path, libraries and loader Maven live under
-/// `/maven`, and asset objects under `/assets`.
-const MIRROR_ROUTES: &[(&str, &str)] = &[
-    ("https://piston-meta.mojang.com", ""),
-    ("https://libraries.minecraft.net", "/maven"),
-    ("https://maven.minecraftforge.net", "/maven"),
-    ("https://maven.neoforged.net/releases", "/maven"),
-    ("https://maven.fabricmc.net", "/maven"),
-    ("https://resources.download.minecraft.net", "/assets"),
-];
-
-pub struct Downloader {
-    client: reqwest::Client,
-    concurrency: usize,
-    offline: bool,
-    mirror: Option<String>,
-}
-
-impl Downloader {
-    pub fn new(concurrency: usize, offline: bool, mirror: Option<String>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(format!(
-                "{}/{}",
-                crate::types::LAUNCHER_NAME,
-                crate::types::LAUNCHER_VERSION
-            ))
-            .connect_timeout(std::time::Duration::from_secs(20))
-            // A stall timeout, not a total budget: large files (client jar, assets,
-            // Java runtimes) may legitimately take many minutes to transfer.
-            .read_timeout(std::time::Duration::from_secs(90))
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
-            .build()?;
-        Ok(Self {
-            client,
-            concurrency: concurrency.clamp(1, 16),
-            offline,
-            mirror,
-        })
-    }
-
-    pub fn offline(&self) -> bool {
-        self.offline
-    }
-
-    /// Rewrite an official URL onto the configured mirror.
-    ///
-    /// The mirror is a host that serves the same files under slightly different
-    /// paths, so each upstream host gets an explicit path prefix. Only mappings
-    /// that have been checked against a live mirror are listed; anything else is
-    /// left untouched rather than guessed at.
-    pub fn map_url(&self, url: &str) -> String {
-        let Some(mirror) = &self.mirror else {
-            return url.to_string();
-        };
-        let mirror = mirror.trim_end_matches('/');
-        let mirror_host = mirror
-            .split("://")
-            .nth(1)
-            .unwrap_or(mirror)
-            .split('/')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        for (upstream, mirror_prefix) in MIRROR_ROUTES {
-            // Never rewrite a URL that already points at the mirror host.
-            if url
-                .split("://")
-                .nth(1)
-                .map(|rest| rest.starts_with(&mirror_host))
-                .unwrap_or(false)
-            {
-                return url.to_string();
-            }
-            if let Some(path) = url.strip_prefix(upstream) {
-                return format!("{mirror}{mirror_prefix}{path}");
-            }
-        }
-        url.to_string()
-    }
-
-    /// Fetch a small resource into memory. Used for metadata documents.
-    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        if self.offline {
-            bail!("严格离线模式下不会访问网络：{url}");
-        }
-        let mapped = self.map_url(url);
-        let mut last_error = None;
-        for attempt in 0..3 {
-            match self.client.get(&mapped).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(ok) => match ok.bytes().await {
-                        Ok(bytes) => return Ok(bytes.to_vec()),
-                        Err(error) => last_error = Some(anyhow!(error)),
-                    },
-                    Err(error) => {
-                        if error.status().map(|s| s.is_client_error()).unwrap_or(false) {
-                            return Err(anyhow!(
-                                "请求失败（{}）：{url}",
-                                error.status().unwrap().as_u16()
-                            ));
-                        }
-                        last_error = Some(anyhow!(error));
-                    }
-                },
-                Err(error) => last_error = Some(anyhow!(error)),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(400 * (attempt + 1) as u64)).await;
-        }
-        Err(last_error.unwrap_or_else(|| anyhow!("请求失败：{url}")))
-            .with_context(|| format!("下载 {url} 失败"))
-    }
-
-    pub async fn fetch_text(&self, url: &str) -> Result<String> {
-        Ok(String::from_utf8_lossy(&self.fetch_bytes(url).await?).to_string())
-    }
-
-    pub async fn fetch_json<T: for<'a> serde::Deserialize<'a>>(&self, url: &str) -> Result<T> {
-        let bytes = self.fetch_bytes(url).await?;
-        serde_json::from_slice(&bytes).with_context(|| format!("解析 {url} 返回的 JSON 失败"))
-    }
-
-    /// Download one file with resume, retry, and integrity verification.
-    pub async fn download(&self, item: &DownloadItem, progress: &Progress) -> Result<()> {
-        if item.is_satisfied() {
-            return Ok(());
-        }
-        if self.offline {
-            bail!(
-                "严格离线模式缺少文件，且不允许下载：{}",
-                item.dest.display()
-            );
-        }
-        progress.check_cancelled()?;
-        if let Some(parent) = item.dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        clean_legacy_partials(&item.dest).await;
-        let temp = temp_path(&item.dest);
-        let mut last_error = None;
-        for attempt in 0..3u32 {
-            progress.check_cancelled()?;
-            match self.attempt(item, &temp).await {
-                Ok(()) => {
-                    if !verify_async(&temp, item).await? {
-                        let _ = tokio::fs::remove_file(&temp).await;
-                        last_error = Some(anyhow!("校验失败：{}", item.dest.display()));
-                        continue;
-                    }
-                    tokio::fs::rename(&temp, &item.dest).await?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        500 * (attempt + 1) as u64,
-                    ))
-                    .await;
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| anyhow!("下载失败：{}", item.url)))
-            .with_context(|| format!("下载 {}", item.dest.display()))
-    }
-
-    async fn attempt(&self, item: &DownloadItem, temp: &Path) -> Result<()> {
-        let existing = tokio::fs::metadata(temp)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        // Only resume when the partial file is smaller than the expected size.
-        let resume_from = match item.size {
-            Some(size) if existing > 0 && existing < size => existing,
-            Some(_) => {
-                let _ = tokio::fs::remove_file(temp).await;
-                0
-            }
-            None => existing,
-        };
-        let url = self.map_url(&item.url);
-        let mut request = self.client.get(&url);
-        if resume_from > 0 {
-            request = request.header(RANGE, format!("bytes={resume_from}-"));
-        }
-        let response = request.send().await?;
-        if !response.status().is_success()
-            && response.status() != reqwest::StatusCode::PARTIAL_CONTENT
-        {
-            bail!("服务器返回 {}：{url}", response.status().as_u16());
-        }
-        let resumed = resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        let mut file = if resumed {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(temp)
-                .await?
-        } else {
-            tokio::fs::File::create(temp).await?
-        };
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        Ok(())
-    }
-
-    /// Download many files with bounded concurrency, reporting each completion.
-    pub async fn download_all(&self, items: Vec<DownloadItem>, progress: &Progress) -> Result<()> {
-        let pending: Vec<DownloadItem> = items
-            .into_iter()
-            .filter(|item| !item.is_satisfied())
-            .collect();
-        if pending.is_empty() {
-            return Ok(());
-        }
-        if self.offline {
-            let missing = pending
-                .iter()
-                .take(5)
-                .map(|item| item.dest.display().to_string())
-                .collect::<Vec<_>>()
-                .join("、");
-            bail!("严格离线模式缺少 {} 个文件，例如：{missing}", pending.len());
-        }
-        let semaphore = Arc::new(Semaphore::new(self.concurrency));
-        let mut set = tokio::task::JoinSet::new();
-        for item in pending {
-            if progress.cancelled() {
-                break;
-            }
-            let permit = semaphore.clone().acquire_owned().await?;
-            let client = self.client.clone();
-            let progress = progress.clone();
-            let mirror = self.mirror.clone();
-            set.spawn(async move {
-                let _permit = permit;
-                let downloader = Downloader {
-                    client,
-                    concurrency: 1,
-                    offline: false,
-                    mirror,
-                };
-                let label = if item.label.is_empty() {
-                    item.dest
-                        .file_name()
-                        .map(|v| v.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                } else {
-                    item.label.clone()
-                };
-                let result = downloader.download(&item, &progress).await;
-                if result.is_ok() {
-                    progress.step("download", label).await;
-                }
-                result
-            });
-        }
-        let mut failure: Option<anyhow::Error> = None;
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    if failure.is_none() {
-                        failure = Some(error);
-                    }
-                }
-                Err(error) => {
-                    if failure.is_none() {
-                        failure = Some(anyhow!(error));
-                    }
-                }
-            }
-        }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    /// Download one file and report progress at file granularity.
-    pub async fn download_one(
+    fn build(
         &self,
-        item: DownloadItem,
-        progress: &Progress,
-        phase: &str,
-    ) -> Result<()> {
-        if item.is_satisfied() {
-            return Ok(());
+        phase: String,
+        message: String,
+        current: u64,
+        total: u64,
+        done: bool,
+        error: Option<String>,
+    ) -> InstallTask {
+        let (downloaded_bytes, total_bytes, active) = self.tracker.snapshot();
+        InstallTask {
+            id: self.task_id.clone(),
+            instance_id: self.instance_id.clone(),
+            phase,
+            current,
+            total,
+            message,
+            done,
+            error,
+            downloaded_bytes,
+            total_bytes,
+            active,
         }
-        self.download(&item, progress).await?;
-        progress
-            .step(
-                phase,
-                if item.label.is_empty() {
-                    item.dest.display().to_string()
-                } else {
-                    item.label.clone()
-                },
-            )
-            .await;
-        Ok(())
     }
+}
+
+/// One entry per destination, so the segment workers of a file merge instead of
+/// racing each other into separate rows.
+pub(super) fn item_key(item: &DownloadItem) -> String {
+    item.dest.to_string_lossy().into_owned()
+}
+
+/// What the UI shows for a file: the plan label, or its file name when the plan
+/// never gave one (the full path stays available through the destination).
+pub(super) fn display_name(item: &DownloadItem) -> String {
+    if !item.label.is_empty() {
+        return item.label.clone();
+    }
+    item.dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.dest.display().to_string())
 }
 
 /// Partial downloads use a deterministic name so an interrupted run can be
@@ -518,7 +477,10 @@ async fn clean_legacy_partials(dest: &Path) {
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(&prefix) && name.ends_with(".part") {
+        let pid = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".part"));
+        if pid.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
             let _ = tokio::fs::remove_file(entry.path()).await;
         }
     }
@@ -560,82 +522,4 @@ pub fn download_item_from(info: &DownloadInfo, dest: PathBuf) -> DownloadItem {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsatisfied_without_metadata() {
-        let item = DownloadItem::new("https://example.invalid/a", PathBuf::from("/tmp/nope-a"));
-        assert!(!item.is_satisfied());
-    }
-
-    #[test]
-    fn mirror_rewrite_keeps_path() {
-        let downloader = Downloader::new(2, false, Some("https://bmclapi2.bangbang93.com".into()))
-            .expect("client");
-        // Version metadata keeps its path.
-        assert_eq!(
-            downloader.map_url("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"),
-            "https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json"
-        );
-        // Libraries move under /maven.
-        assert_eq!(
-            downloader.map_url("https://libraries.minecraft.net/org/ow2/asm/asm/9.6/asm-9.6.jar"),
-            "https://bmclapi2.bangbang93.com/maven/org/ow2/asm/asm/9.6/asm-9.6.jar"
-        );
-        // Loader Maven uses the same prefix, with the /releases segment dropped.
-        assert_eq!(
-            downloader.map_url(
-                "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.255/neoforge-21.1.255-installer.jar"
-            ),
-            "https://bmclapi2.bangbang93.com/maven/net/neoforged/neoforge/21.1.255/neoforge-21.1.255-installer.jar"
-        );
-        // Asset objects move under /assets.
-        assert_eq!(
-            downloader.map_url("https://resources.download.minecraft.net/ab/abcdef"),
-            "https://bmclapi2.bangbang93.com/assets/ab/abcdef"
-        );
-        // Hosts without a verified mapping are left alone, including piston-data.
-        assert_eq!(
-            downloader.map_url("https://meta.fabricmc.net/v2/versions/game"),
-            "https://meta.fabricmc.net/v2/versions/game"
-        );
-        assert_eq!(
-            downloader.map_url("https://piston-data.mojang.com/v1/objects/aa/bb/client.jar"),
-            "https://piston-data.mojang.com/v1/objects/aa/bb/client.jar"
-        );
-        // A URL already on the mirror is never rewritten twice.
-        assert_eq!(
-            downloader.map_url("https://bmclapi2.bangbang93.com/mc/game/x.json"),
-            "https://bmclapi2.bangbang93.com/mc/game/x.json"
-        );
-    }
-
-    #[test]
-    fn no_mirror_leaves_urls_untouched() {
-        let downloader = Downloader::new(2, false, None).expect("client");
-        assert_eq!(
-            downloader.map_url("https://libraries.minecraft.net/a/b.jar"),
-            "https://libraries.minecraft.net/a/b.jar"
-        );
-    }
-
-    #[test]
-    fn resource_url_uses_hash_prefix() {
-        assert_eq!(
-            resource_url("abcdef1234567890"),
-            format!("{RESOURCES_URL}/ab/abcdef1234567890")
-        );
-    }
-
-    #[test]
-    fn partial_name_is_stable_across_runs() {
-        // A deterministic partial name is what makes resume-after-restart work.
-        let dest = PathBuf::from("/tmp/libraries/foo.jar");
-        assert_eq!(
-            temp_path(&dest),
-            PathBuf::from("/tmp/libraries/foo.jar.part")
-        );
-        assert_eq!(temp_path(&dest), temp_path(&dest));
-    }
-}
+mod tests;

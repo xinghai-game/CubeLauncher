@@ -40,7 +40,7 @@ pub fn offline_uuid_compact(name: &str) -> String {
     offline_uuid(name).replace('-', "")
 }
 
-fn slug(value: &str) -> String {
+pub(crate) fn slug(value: &str) -> String {
     let slug: String = value
         .chars()
         .map(|character| {
@@ -60,7 +60,9 @@ fn slug(value: &str) -> String {
 }
 
 impl crate::LauncherCore {
-    pub async fn accounts(&self) -> Result<Vec<OfflineAccount>> {
+    /// Every stored identity, offline roles and Microsoft accounts alike.
+    /// Entries written by older versions (offline only) parse unchanged.
+    pub async fn accounts(&self) -> Result<Vec<Account>> {
         let path = self.paths.root.join("accounts.json");
         let Ok(bytes) = tokio::fs::read(&path).await else {
             return Ok(Vec::new());
@@ -68,31 +70,68 @@ impl crate::LauncherCore {
         Ok(serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    async fn write_accounts(&self, accounts: &[OfflineAccount]) -> Result<()> {
-        crate::atomic_write(
+    /// The account file holds refresh tokens, so it is written owner-only.
+    async fn write_accounts(&self, accounts: &[Account]) -> Result<()> {
+        crate::atomic_write_private(
             &self.paths.root.join("accounts.json"),
             &serde_json::to_vec_pretty(accounts)?,
         )
         .await
     }
 
-    pub async fn add_offline_account(&self, name: &str) -> Result<OfflineAccount> {
+    pub async fn account(&self, id: &str) -> Option<Account> {
+        self.accounts()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|account| account.id == id)
+    }
+
+    pub async fn add_offline_account(&self, name: &str) -> Result<Account> {
         let name = name.trim();
         validate_username(name)?;
         let mut accounts = self.accounts().await?;
-        if accounts.iter().any(|account| account.name == name) {
+        if accounts
+            .iter()
+            .any(|account| !account.is_microsoft() && account.name == name)
+        {
             bail!("离线角色 “{name}” 已经存在");
         }
-        let account = OfflineAccount {
+        let account = Account {
             id: offline_uuid(name),
             name: name.to_string(),
             uuid: offline_uuid(name),
             kind: "offline".to_string(),
             created_at: Utc::now(),
+            microsoft: None,
         };
         accounts.push(account.clone());
         self.write_accounts(&accounts).await?;
         Ok(account)
+    }
+
+    /// Store a Microsoft account, replacing the entry for the same UUID. This is
+    /// both "add account" and "sign in again", which is what makes a repeated
+    /// login converge instead of piling up duplicates.
+    pub async fn upsert_account(&self, account: Account) -> Result<Account> {
+        let mut accounts = self.accounts().await?;
+        match accounts.iter().position(|entry| entry.id == account.id) {
+            Some(index) => accounts[index] = account.clone(),
+            None => accounts.push(account.clone()),
+        }
+        self.write_accounts(&accounts).await?;
+        Ok(account)
+    }
+
+    /// Keep the stored tokens in step with a refreshed account. A missing entry
+    /// is not an error: the account may have been deleted while it was used.
+    pub async fn update_account(&self, account: &Account) -> Result<()> {
+        let mut accounts = self.accounts().await?;
+        let Some(entry) = accounts.iter_mut().find(|entry| entry.id == account.id) else {
+            return Ok(());
+        };
+        *entry = account.clone();
+        self.write_accounts(&accounts).await
     }
 
     pub async fn delete_account(&self, id: &str) -> Result<()> {
@@ -158,6 +197,8 @@ impl crate::LauncherCore {
             name: name.to_string(),
             game_version: game_version.to_string(),
             loader,
+            version_id: None,
+            game_dir: None,
             loader_version,
             account_id,
             java_path: self.settings.default_java.clone(),
@@ -202,7 +243,8 @@ impl crate::LauncherCore {
     }
 
     /// Delete an instance directory. The caller must confirm in the UI, because this
-    /// removes saves and mods that live inside the instance.
+    /// removes saves and mods that live inside the instance. An imported `.minecraft`
+    /// lives outside that directory and is therefore never touched.
     pub async fn delete_instance(&self, id: &str) -> Result<()> {
         if self.processes().is_running(id).await {
             bail!("实例正在运行，请先退出游戏");
@@ -216,12 +258,15 @@ impl crate::LauncherCore {
         Ok(())
     }
 
-    pub fn mods_dir(&self, id: &str) -> PathBuf {
-        self.paths.game_dir(id).join("mods")
+    /// Mods folder of an instance: inside its imported game directory when it has
+    /// one, otherwise inside the launcher-managed `.minecraft`.
+    pub fn mods_dir(&self, instance: &Instance) -> PathBuf {
+        self.game_dir(instance).join("mods")
     }
 
+    /// Same, by instance id, for callers that only carry an id around.
     pub async fn ensure_mods_dir(&self, id: &str) -> Result<PathBuf> {
-        let dir = self.mods_dir(id);
+        let dir = self.mods_dir(&self.instance(id).await?);
         tokio::fs::create_dir_all(&dir).await?;
         Ok(dir)
     }
@@ -390,6 +435,160 @@ mod tests {
         assert_eq!(slug("My World"), "my-world");
         assert_eq!(slug("暮色草原"), "instance");
         assert_eq!(slug("  trim  "), "trim");
+    }
+
+    /* ------------------------------------------------------------ accounts */
+
+    /// A core with its own data directory, plus a cleanup on drop.
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn core_with_data_dir(label: &str) -> (crate::LauncherCore, TestDir) {
+        let dir = std::env::temp_dir().join(format!(
+            "cube-account-{label}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let settings = AppSettings {
+            data_dir: dir.clone(),
+            ..Default::default()
+        };
+        let core = crate::LauncherCore::new(settings).await.expect("core");
+        (core, TestDir(dir))
+    }
+
+    fn microsoft_account(id: &str, name: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            name: name.to_string(),
+            uuid: crate::auth::dashed_uuid(id),
+            kind: "microsoft".into(),
+            created_at: Utc::now(),
+            microsoft: Some(MicrosoftAccount {
+                xuid: "2535412345678901".into(),
+                refresh_token: format!("refresh-{name}"),
+                access_token: format!("access-{name}"),
+                access_expires_at: Some(Utc::now() + chrono::Duration::hours(12)),
+                skin_url: None,
+                owns_java: true,
+                last_login: Some(Utc::now()),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn accounts_survive_a_round_trip_and_are_deleted_by_id() {
+        let (core, _dir) = core_with_data_dir("round-trip").await;
+        let offline = core.add_offline_account("Alice").await.unwrap();
+        assert_eq!(offline.kind, "offline");
+        assert!(offline.microsoft.is_none());
+        assert!(
+            core.add_offline_account("Alice").await.is_err(),
+            "duplicate name"
+        );
+        assert!(core.add_offline_account("a").await.is_err(), "too short");
+
+        let id = "069a79f444e94726a5befca90e38aaf5";
+        core.upsert_account(microsoft_account(id, "Steve"))
+            .await
+            .unwrap();
+        let accounts = core.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert!(accounts.iter().any(|account| account.is_microsoft()));
+
+        core.delete_account(id).await.unwrap();
+        assert_eq!(core.accounts().await.unwrap().len(), 1);
+        assert!(core.delete_account(id).await.is_err(), "already gone");
+    }
+
+    #[tokio::test]
+    async fn signing_in_again_updates_instead_of_duplicating() {
+        let (core, _dir) = core_with_data_dir("upsert").await;
+        let id = "069a79f444e94726a5befca90e38aaf5";
+        core.upsert_account(microsoft_account(id, "Steve"))
+            .await
+            .unwrap();
+        let mut renamed = microsoft_account(id, "Alex");
+        renamed.microsoft.as_mut().unwrap().access_token = "access-alex".into();
+        core.upsert_account(renamed).await.unwrap();
+
+        let accounts = core.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1, "same UUID means same account");
+        assert_eq!(accounts[0].name, "Alex");
+        assert_eq!(
+            accounts[0].microsoft.as_ref().unwrap().access_token,
+            "access-alex"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_tokens_are_written_back() {
+        let (core, _dir) = core_with_data_dir("refresh").await;
+        let id = "069a79f444e94726a5befca90e38aaf5";
+        let mut account = microsoft_account(id, "Steve");
+        core.upsert_account(account.clone()).await.unwrap();
+        account.microsoft.as_mut().unwrap().access_token = "access-new".into();
+        core.update_account(&account).await.unwrap();
+        assert_eq!(
+            core.account(id)
+                .await
+                .unwrap()
+                .microsoft
+                .unwrap()
+                .access_token,
+            "access-new"
+        );
+        // Updating an account that is gone is a no-op, not an error: it may have
+        // been deleted while it was being refreshed.
+        core.delete_account(id).await.unwrap();
+        core.update_account(&account).await.unwrap();
+    }
+
+    /// Files written by the offline-only versions of the launcher must keep
+    /// loading, and the file must not become world-readable once it holds a
+    /// refresh token.
+    #[tokio::test]
+    async fn account_file_migrates_and_stays_private() {
+        let (core, dir) = core_with_data_dir("private").await;
+        let legacy = format!(
+            r#"[{{"id":"{0}","name":"Alice","uuid":"{0}","kind":"offline","created_at":"2026-01-01T00:00:00Z"}}]"#,
+            offline_uuid("Alice")
+        );
+        tokio::fs::write(dir.0.join("accounts.json"), legacy)
+            .await
+            .unwrap();
+        let accounts = core.accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "Alice");
+        assert!(accounts[0].microsoft.is_none());
+
+        core.upsert_account(microsoft_account(
+            "069a79f444e94726a5befca90e38aaf5",
+            "Steve",
+        ))
+        .await
+        .unwrap();
+        let stored = tokio::fs::read_to_string(dir.0.join("accounts.json"))
+            .await
+            .unwrap();
+        assert!(stored.contains("refresh-Steve"), "{stored}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.0.join("accounts.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "refresh tokens must stay owner-only");
+        }
     }
 
     #[test]

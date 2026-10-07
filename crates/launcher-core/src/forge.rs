@@ -46,13 +46,11 @@ impl crate::LauncherCore {
             .unwrap_or("installer.jar")
             .to_string();
         let installer_path = installer_dir.join(&installer_name);
-        self.downloader
-            .download(
-                &DownloadItem::new(source.url.clone(), installer_path.clone())
-                    .with_label(format!("{} 安装器", loader.label())),
-                progress,
-            )
-            .await?;
+        let installer_item = DownloadItem::new(source.url.clone(), installer_path.clone())
+            .with_label(format!("{} 安装器", loader.label()));
+        // A batch of its own: the installer is unrelated to the files just verified.
+        progress.begin_batch(std::slice::from_ref(&installer_item));
+        self.downloader.download(&installer_item, progress).await?;
 
         // Read the profile and the version document that belongs to this installer.
         let installer = installer_path.clone();

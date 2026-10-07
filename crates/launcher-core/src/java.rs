@@ -335,6 +335,8 @@ impl crate::LauncherCore {
                     size: Some(package.size),
                     label: format!("Java {major}"),
                 };
+                // A retry starts from an empty partial, so its byte bar does too.
+                progress.begin_batch(std::slice::from_ref(&item));
                 match self.downloader.download(&item, progress).await {
                     Ok(()) => {
                         downloaded = true;

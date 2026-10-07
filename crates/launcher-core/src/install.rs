@@ -4,7 +4,7 @@ use crate::rules::{classpath_entry, maven_path, native_classifier, require_java_
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Everything the launcher has to place on disk for one version.
 pub struct InstallPlan {
@@ -25,18 +25,25 @@ impl crate::LauncherCore {
         progress
             .stage("prepare", format!("准备安装 {}", instance.name))
             .await;
-        let lock = match instance.loader {
-            Loader::Vanilla => self.install_vanilla(instance, &progress).await?,
-            Loader::Fabric => self.install_fabric(instance, &progress).await?,
-            Loader::Forge => {
-                self.install_forge_like(instance, &progress, Loader::Forge)
-                    .await?
-            }
-            Loader::NeoForge => {
-                self.install_forge_like(instance, &progress, Loader::NeoForge)
-                    .await?
+        let lock = if instance.version_id.is_some() && instance.game_dir.is_some() {
+            // An imported installation already has its version document on disk:
+            // read it, place whatever is missing next to it and stop there.
+            self.install_imported(instance, &progress).await?
+        } else {
+            match instance.loader {
+                Loader::Vanilla => self.install_vanilla(instance, &progress).await?,
+                Loader::Fabric => self.install_fabric(instance, &progress).await?,
+                Loader::Forge => {
+                    self.install_forge_like(instance, &progress, Loader::Forge)
+                        .await?
+                }
+                Loader::NeoForge => {
+                    self.install_forge_like(instance, &progress, Loader::NeoForge)
+                        .await?
+                }
             }
         };
+        progress.check_cancelled()?;
         let mut updated = instance.clone();
         updated.installed = true;
         updated.loader_version = lock.loader_version.clone();
@@ -57,7 +64,7 @@ impl crate::LauncherCore {
         instance: &Instance,
         progress: &Progress,
     ) -> Result<InstallLock> {
-        let plan = self.plan_vanilla(&instance.game_version).await?;
+        let plan = self.plan_instance(instance).await?;
         self.apply_plan(instance, &plan, progress).await?;
         let lock = InstallLock {
             schema_version: 1,
@@ -77,12 +84,73 @@ impl crate::LauncherCore {
         Ok(lock)
     }
 
-    pub async fn plan_vanilla(&self, game_version: &str) -> Result<InstallPlan> {
-        let resolved = self.resolve_version(game_version).await?;
-        self.plan_for(&resolved).await
+    /// Repair an imported installation from its own version document instead of
+    /// reinstalling a loader. Whatever the game directory already provides is kept,
+    /// only genuinely missing files are fetched.
+    async fn install_imported(
+        &self,
+        instance: &Instance,
+        progress: &Progress,
+    ) -> Result<InstallLock> {
+        progress.stage("prepare", "读取导入目录的版本文件").await;
+        let layout = self.layout(instance);
+        let version_id = instance.version_id.clone().unwrap_or_default();
+        let document = layout
+            .version_doc(&version_id)
+            .ok_or_else(|| anyhow!("找不到版本文件 {version_id}.json，请检查游戏目录"))?;
+        let resolved = self.resolve_for_install(instance).await?;
+        let mut plan = self.plan_for(&layout, &resolved).await?;
+        let planned = plan.files.len();
+        plan.files.retain(|item| !layout.satisfied(item));
+        progress
+            .stage(
+                "download",
+                format!(
+                    "导入目录已提供 {} 个文件，需要补齐 {} 个",
+                    planned - plan.files.len(),
+                    plan.files.len()
+                ),
+            )
+            .await;
+        self.apply_plan(instance, &plan, progress).await?;
+        let lock = InstallLock {
+            schema_version: 1,
+            game_version: instance.game_version.clone(),
+            loader: instance.loader,
+            loader_version: instance.loader_version.clone(),
+            metadata_path: Some(document),
+            installed_at: chrono::Utc::now(),
+            java_major: Some(plan.java_major),
+            mods_managed: layout.game_dir.join("mods").is_dir(),
+        };
+        self.write_lock(&instance.id, &lock).await?;
+        Ok(lock)
     }
 
-    pub async fn plan_for(&self, resolved: &ResolvedVersion) -> Result<InstallPlan> {
+    /// Plan a version that is not attached to an instance yet, using the
+    /// launcher's own directories (the version list and the smoke harness do this).
+    pub async fn plan_vanilla(&self, game_version: &str) -> Result<InstallPlan> {
+        let resolved = self.resolve_version(game_version).await?;
+        self.plan_for(&self.data_layout(), &resolved).await
+    }
+
+    /// Plan the files one instance needs, preferring what its own game directory
+    /// already holds: an imported `.minecraft` is reused, not downloaded again.
+    pub async fn plan_instance(&self, instance: &Instance) -> Result<InstallPlan> {
+        let resolved = self.resolve_for_install(instance).await?;
+        let layout = self.layout(instance);
+        let mut plan = self.plan_for(&layout, &resolved).await?;
+        plan.files.retain(|item| !layout.satisfied(item));
+        Ok(plan)
+    }
+
+    /// Build the download list for one resolved version. `layout` decides where the
+    /// files are written, so an imported game directory keeps its own libraries.
+    pub async fn plan_for(
+        &self,
+        layout: &crate::gamedir::InstanceLayout,
+        resolved: &ResolvedVersion,
+    ) -> Result<InstallPlan> {
         let platform = crate::rules::Platform::current();
         let env = crate::rules::RuleEnv::new(true, !platform.os_version.is_empty());
         let java_major = require_java_major(
@@ -116,7 +184,7 @@ impl crate::LauncherCore {
                 continue;
             }
             if let Some((path, url)) = classpath_entry(library, &platform) {
-                let dest = self.paths.libraries.join(&path);
+                let dest = layout.libraries.join(&path);
                 if seen.insert(dest.clone()) {
                     files.push(
                         DownloadItem::new(url, dest)
@@ -127,7 +195,7 @@ impl crate::LauncherCore {
                 }
             }
             if let Some((path, info)) = native_classifier(library, &platform) {
-                let dest = self.paths.libraries.join(&path);
+                let dest = layout.libraries.join(&path);
                 if seen.insert(dest.clone()) {
                     // Native classifiers carry their own hash: verify against that.
                     natives.push(
@@ -142,8 +210,7 @@ impl crate::LauncherCore {
         // Asset index and every object it lists.
         let mut asset_count = 0;
         if let Some(index) = &resolved.meta.asset_index {
-            let index_path = self
-                .paths
+            let index_path = layout
                 .assets
                 .join("indexes")
                 .join(format!("{}.json", index.id));
@@ -156,12 +223,8 @@ impl crate::LauncherCore {
             let assets = self.ensure_asset_index(&index_path, index).await?;
             for object in assets.objects.values() {
                 asset_count += 1;
-                let dest = self
-                    .paths
-                    .assets
-                    .join("objects")
-                    .join(&object.hash[..2])
-                    .join(&object.hash);
+                let relative = asset_object_relative(&object.hash)?;
+                let dest = layout.assets.join(relative);
                 if seen.insert(dest.clone()) {
                     files.push(
                         DownloadItem::new(resource_url(&object.hash), dest)
@@ -180,7 +243,10 @@ impl crate::LauncherCore {
             .as_ref()
             .and_then(|logging| logging.client.as_ref())
         {
-            let dest = self.log_config_path(&resolved.meta.id);
+            let dest = layout
+                .assets
+                .join("log_configs")
+                .join(format!("{}.xml", resolved.meta.id));
             files.push(
                 crate::download::download_item_from(&logging.file, dest.clone())
                     .with_label("日志配置"),
@@ -235,17 +301,18 @@ impl crate::LauncherCore {
     }
 
     /// Fetch a version jar from disk, preferring a loader version jar when present.
-    pub fn version_jar_for(&self, version_id: &str, fallback_version: &str) -> Option<PathBuf> {
-        let loader_jar = self
-            .paths
-            .versions_dir()
-            .join(version_id)
-            .join(format!("{version_id}.jar"));
-        if loader_jar.is_file() {
-            return Some(loader_jar);
-        }
-        let vanilla = self.client_jar_path(fallback_version);
-        vanilla.is_file().then_some(vanilla)
+    /// The instance's own game directory is searched before the launcher's cache,
+    /// so an imported installation uses the jar it already has.
+    pub fn version_jar_for(
+        &self,
+        instance: &Instance,
+        version_id: &str,
+        fallback_version: &str,
+    ) -> Option<PathBuf> {
+        let layout = self.layout(instance);
+        layout
+            .version_jar(version_id)
+            .or_else(|| layout.version_jar(fallback_version))
     }
 
     /// Download a plan with reporting, then extract legacy natives.
@@ -269,8 +336,101 @@ impl crate::LauncherCore {
         self.downloader
             .download_all(plan.files.clone(), progress)
             .await?;
+        let missing = self.ensure_assets(instance, &plan.resolved, false).await?;
+        if !missing.is_empty() {
+            bail!(
+                "资源下载完成后仍缺少 {} 个文件：{}",
+                missing.len(),
+                missing.iter().take(3).cloned().collect::<Vec<_>>().join("、")
+            );
+        }
         self.extract_natives(instance, &plan.resolved).await?;
         Ok(())
+    }
+
+    /// Ensure the asset index is usable by the game. Modern versions read the
+    /// hashed object store directly; legacy indexes additionally need the
+    /// logical `virtual/legacy` tree created by Mojang's launcher.
+    pub async fn ensure_assets(
+        &self,
+        instance: &Instance,
+        resolved: &ResolvedVersion,
+        verify_hashes: bool,
+    ) -> Result<Vec<String>> {
+        let Some(index) = &resolved.meta.asset_index else {
+            return Ok(Vec::new());
+        };
+        let layout = self.layout(instance);
+        let index_relative = format!("indexes/{}.json", index.id);
+        let Some(index_path) = layout.asset(&index_relative) else {
+            return Ok(vec![format!("缺少资源索引 {}", index.id)]);
+        };
+        if !index.sha1.is_empty()
+            && !asset_file_matches(&index_path, index.size, &index.sha1, true)
+        {
+            return Ok(vec![format!("资源索引 {} 已损坏", index.id)]);
+        }
+        let assets = self.read_assets_index(&index_path).await?;
+        let legacy = assets.virtual_.unwrap_or(false)
+            || assets.map_to_resources.unwrap_or(false)
+            || resolved.meta.assets.as_deref() == Some("legacy");
+        let virtual_root = layout.assets.join("virtual").join("legacy");
+        let mut missing = Vec::new();
+
+        for (name, object) in assets.objects {
+            let relative = match asset_object_relative(&object.hash) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    missing.push(format!("资源 {name}（{error:#}）"));
+                    continue;
+                }
+            };
+            let object_path = layout.asset(&relative);
+            let object_ok = object_path
+                .as_deref()
+                .map(|path| asset_file_matches(path, object.size, &object.hash, verify_hashes))
+                .unwrap_or(false);
+            let virtual_path = if legacy {
+                let logical = safe_asset_relative(&name)?;
+                Some(virtual_root.join(logical))
+            } else {
+                None
+            };
+
+            if !object_ok {
+                if virtual_path
+                    .as_deref()
+                    .map(|path| asset_file_matches(path, object.size, &object.hash, verify_hashes))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                missing.push(format!("资源 {name}"));
+                continue;
+            }
+
+            if let Some(destination) = virtual_path {
+                let destination_ok = asset_file_matches(
+                    &destination,
+                    object.size,
+                    &object.hash,
+                    verify_hashes,
+                );
+                if !destination_ok {
+                    let source = object_path.as_ref().expect("object_ok implies a source");
+                    materialize_legacy_asset(source, &destination, object.size).await?;
+                    if !asset_file_matches(
+                        &destination,
+                        object.size,
+                        &object.hash,
+                        verify_hashes,
+                    ) {
+                        missing.push(format!("资源映射 {name}"));
+                    }
+                }
+            }
+        }
+        Ok(missing)
     }
 
     /// Extract old-style native classifier jars into the instance natives directory.
@@ -281,7 +441,8 @@ impl crate::LauncherCore {
     ) -> Result<()> {
         let platform = crate::rules::Platform::current();
         let env = crate::rules::RuleEnv::new(true, !platform.os_version.is_empty());
-        let natives_dir = self.paths.natives_dir(&instance.id);
+        let layout = self.layout(instance);
+        let natives_dir = layout.natives_dir.clone();
         tokio::fs::create_dir_all(&natives_dir).await?;
         for library in &resolved.meta.libraries {
             if !crate::rules::library_allowed(library, &platform, &env) {
@@ -290,10 +451,10 @@ impl crate::LauncherCore {
             let Some((path, _url)) = native_classifier(library, &platform) else {
                 continue;
             };
-            let archive = self.paths.libraries.join(&path);
-            if !archive.is_file() {
+            // Read the archive from wherever the instance keeps its libraries.
+            let Some(archive) = layout.library(&path) else {
                 continue;
-            }
+            };
             let exclude = library
                 .extract
                 .as_ref()
@@ -468,17 +629,20 @@ impl crate::LauncherCore {
             .collect())
     }
 
-    /// Verify that an installed instance still has every file it needs.
+    /// Verify that an installed instance still has every file it needs. Files are
+    /// looked up in the instance's own game directory first, so an imported
+    /// installation verifies as complete without downloading anything.
     pub async fn verify_instance(&self, instance: &Instance) -> Result<Vec<String>> {
         let Some(lock) = self.install_lock(&instance.id).await else {
             return Ok(vec!["实例尚未安装".to_string()]);
         };
-        let resolved = self.resolved_for(&instance.id).await?;
+        let resolved = self.resolved_for(instance).await?;
+        let layout = self.layout(instance);
         let platform = crate::rules::Platform::current();
         let env = crate::rules::RuleEnv::new(true, !platform.os_version.is_empty());
         let mut missing = Vec::new();
         if self
-            .version_jar_for(&resolved.meta.id, &resolved.jar_version)
+            .version_jar_for(instance, &resolved.meta.id, &resolved.jar_version)
             .is_none()
         {
             missing.push(format!("缺少版本 JAR：{}", resolved.meta.id));
@@ -488,22 +652,12 @@ impl crate::LauncherCore {
                 continue;
             }
             if let Some((path, _url)) = classpath_entry(library, &platform) {
-                let dest = self.paths.libraries.join(&path);
-                if !dest.is_file() {
+                if layout.library(&path).is_none() {
                     missing.push(short_name(&library.name));
                 }
             }
         }
-        if let Some(index) = &resolved.meta.asset_index {
-            let index_path = self
-                .paths
-                .assets
-                .join("indexes")
-                .join(format!("{}.json", index.id));
-            if !index_path.is_file() {
-                missing.push(format!("缺少资源索引 {}", index.id));
-            }
-        }
+        missing.extend(self.ensure_assets(instance, &resolved, true).await?);
         if missing.is_empty() {
             // A cheap consistency check: the lock must match the instance's loader.
             if lock.loader != instance.loader {
@@ -513,12 +667,43 @@ impl crate::LauncherCore {
         Ok(missing)
     }
 
+    /// Resolve metadata needed while installing. A new or failed managed instance
+    /// has no install.lock yet, so launch-time resolution is intentionally not used.
+    async fn resolve_for_install(&self, instance: &Instance) -> Result<ResolvedVersion> {
+        let layout = self.layout(instance);
+        if let Some(version_id) = instance.version_id.as_deref() {
+            let path = layout
+                .version_doc(version_id)
+                .ok_or_else(|| anyhow!("找不到版本文件 {version_id}.json，请检查游戏目录"))?;
+            let meta = self.version_meta_from_path(&path).await?;
+            return self
+                .resolve_from_meta_in(&layout.version_roots, meta, version_id.to_string())
+                .await;
+        }
+        self.resolve_version_in(&layout.version_roots, &instance.game_version)
+            .await
+    }
+
     /// Resolve the version chain that an installed instance should launch.
-    pub async fn resolved_for(&self, instance_id: &str) -> Result<ResolvedVersion> {
+    ///
+    /// An imported installation carries its own version document, so that is read
+    /// first (and its `inheritsFrom` parents from the same directory), which keeps
+    /// launching independent of the launcher's metadata cache and of the network.
+    pub async fn resolved_for(&self, instance: &Instance) -> Result<ResolvedVersion> {
         let lock = self
-            .install_lock(instance_id)
+            .install_lock(&instance.id)
             .await
             .ok_or_else(|| anyhow!("实例尚未安装，请先安装"))?;
+        let layout = self.layout(instance);
+        if let Some(version_id) = instance.version_id.as_deref() {
+            let path = layout
+                .version_doc(version_id)
+                .ok_or_else(|| anyhow!("找不到版本文件 {version_id}.json，请检查游戏目录"))?;
+            let meta = self.version_meta_from_path(&path).await?;
+            return self
+                .resolve_from_meta_in(&layout.version_roots, meta, version_id.to_string())
+                .await;
+        }
         match (&lock.metadata_path, lock.loader) {
             (Some(path), Loader::Fabric)
             | (Some(path), Loader::Forge)
@@ -527,15 +712,96 @@ impl crate::LauncherCore {
             {
                 let meta = self.version_meta_from_path(path).await?;
                 let id = meta.id.clone();
-                self.resolve_from_meta(meta, id).await
+                self.resolve_from_meta_in(&layout.version_roots, meta, id)
+                    .await
             }
-            _ => self.resolve_version(&lock.game_version).await,
+            _ => {
+                self.resolve_version_in(&layout.version_roots, &lock.game_version)
+                    .await
+            }
         }
     }
 }
 
 pub fn shortcut_target(instance: &Instance) -> PathBuf {
     PathBuf::from(&instance.id)
+}
+
+fn asset_object_relative(hash: &str) -> Result<String> {
+    if hash.len() < 2 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("资源对象哈希无效：{hash}");
+    }
+    Ok(format!("objects/{}/{}", &hash[..2], hash))
+}
+
+fn safe_asset_relative(name: &str) -> Result<PathBuf> {
+    let path = Path::new(name);
+    if name.is_empty() || path.is_absolute() {
+        bail!("资源路径无效：{name}");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("资源路径越界：{name}");
+    }
+    Ok(path.to_path_buf())
+}
+
+fn asset_file_matches(path: &Path, size: u64, hash: &str, verify_hash: bool) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != size {
+        return false;
+    }
+    if !verify_hash {
+        return true;
+    }
+    DownloadItem::new("", path.to_path_buf())
+        .with_sha1(Some(hash.to_string()))
+        .with_size(Some(size))
+        .is_satisfied()
+}
+
+async fn materialize_legacy_asset(source: &Path, destination: &Path, _size: u64) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("资源映射没有父目录：{}", destination.display()))?;
+    tokio::fs::create_dir_all(parent).await?;
+    if destination.is_dir() {
+        bail!("资源映射目标是目录：{}", destination.display());
+    }
+    if destination.exists() {
+        tokio::fs::remove_file(destination).await?;
+    }
+
+    let file_name = destination
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "asset".to_string());
+    let temporary = parent.join(format!(".{file_name}.cubelauncher-part-{}", std::process::id()));
+    let _ = tokio::fs::remove_file(&temporary).await;
+    if let Err(link_error) = tokio::fs::hard_link(source, &temporary).await {
+        tokio::fs::copy(source, &temporary)
+            .await
+            .with_context(|| {
+                format!(
+                    "创建旧版资源映射失败：{} -> {}（硬链接失败：{link_error}）",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+    }
+    tokio::fs::rename(&temporary, destination).await.with_context(|| {
+        format!(
+            "写入旧版资源映射失败：{}",
+            destination.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn library_sha1(library: &Library) -> Option<String> {
@@ -680,6 +946,72 @@ pub fn expand_installer_value(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn failed_install_can_be_retried_without_an_install_lock() {
+        let root =
+            std::env::temp_dir().join(format!("cube-install-initial-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let settings = AppSettings {
+            data_dir: root.join("data"),
+            offline_mode: true,
+            ..Default::default()
+        };
+        let core = crate::LauncherCore::new(settings).await.expect("core");
+        let version_path = core.paths.versions_dir().join("1.20.1.json");
+        tokio::fs::create_dir_all(version_path.parent().expect("version parent"))
+            .await
+            .expect("version directory");
+        tokio::fs::write(
+            &version_path,
+            br#"{
+                "id": "1.20.1",
+                "mainClass": "net.minecraft.client.main.Main",
+                "downloads": {
+                    "client": {
+                        "url": "https://example.invalid/client.jar",
+                        "size": 4
+                    }
+                },
+                "libraries": []
+            }"#,
+        )
+        .await
+        .expect("version metadata");
+
+        let instance = core
+            .create_instance("Fresh", "1.20.1", Loader::Vanilla, None, None)
+            .await
+            .expect("instance");
+        assert!(core.install_lock(&instance.id).await.is_none());
+
+        let cancelled = Progress::new(None, &instance.id);
+        cancelled
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(core.install_instance(&instance, cancelled).await.is_err());
+        assert!(core.install_lock(&instance.id).await.is_none());
+
+        let client_jar = core.client_jar_path("1.20.1");
+        tokio::fs::create_dir_all(client_jar.parent().expect("client parent"))
+            .await
+            .expect("client directory");
+        tokio::fs::write(&client_jar, b"jar!")
+            .await
+            .expect("reusable client");
+        let lock = core
+            .install_instance(&instance, Progress::new(None, &instance.id))
+            .await
+            .expect("retry install");
+        assert_eq!(lock.loader, Loader::Vanilla);
+        assert!(
+            core.instance(&instance.id)
+                .await
+                .expect("saved instance")
+                .installed
+        );
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[test]
     fn data_values_are_classified() {
         assert_eq!(
@@ -713,14 +1045,145 @@ mod tests {
     }
 
     #[test]
-    fn unknown_variable_is_reported() {
-        let mut data = HashMap::new();
-        data.insert("MC_SLIM".to_string(), "/tmp/slim.jar".to_string());
-        let extra = HashMap::new();
+    fn asset_index_virtual_flag_and_paths_are_safe() {
+        let assets: AssetsFile = serde_json::from_str(
+            r#"{
+                "virtual": true,
+                "objects": {
+                    "minecraft/lang/en_us.lang": {"hash": "abcdef", "size": 3}
+                }
+            }"#,
+        )
+        .expect("asset index");
+        assert_eq!(assets.virtual_, Some(true));
+        assert_eq!(asset_object_relative("abcdef").expect("object path"), "objects/ab/abcdef");
+        assert!(asset_object_relative("x").is_err());
+        assert!(safe_asset_relative("minecraft/lang/en_us.lang").is_ok());
+        assert!(safe_asset_relative("../outside").is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_assets_materializes_legacy_files_and_reports_missing() {
+        use sha1::{Digest, Sha1};
+
+        let root = std::env::temp_dir().join(format!("cube-asset-check-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let core = crate::LauncherCore::new(AppSettings {
+            data_dir: root.join("data"),
+            offline_mode: true,
+            ..Default::default()
+        })
+        .await
+        .expect("core");
+        let instance = Instance {
+            id: "legacy".into(),
+            name: "Legacy".into(),
+            game_version: "1.7.10".into(),
+            loader: Loader::Vanilla,
+            version_id: None,
+            game_dir: None,
+            loader_version: None,
+            account_id: None,
+            java_path: None,
+            min_memory_mb: 1024,
+            max_memory_mb: 4096,
+            jvm_args: Vec::new(),
+            game_args: Vec::new(),
+            width: Some(1280),
+            height: Some(720),
+            fullscreen: false,
+            installed: true,
+            last_played: None,
+            created_at: chrono::Utc::now(),
+        };
+        let object_bytes = b"abc";
+        let object_hash = hex::encode(Sha1::digest(object_bytes));
+        let index_bytes = serde_json::to_vec(&serde_json::json!({
+            "virtual": true,
+            "objects": {
+                "minecraft/lang/en_us.lang": {
+                    "hash": object_hash,
+                    "size": object_bytes.len()
+                }
+            }
+        }))
+        .expect("index json");
+        let index_hash = hex::encode(Sha1::digest(&index_bytes));
+        let index = AssetIndex {
+            id: "legacy".into(),
+            sha1: index_hash,
+            size: index_bytes.len() as u64,
+            total_size: None,
+            url: String::new(),
+        };
+        let resolved = ResolvedVersion {
+            meta: VersionMeta {
+                id: "legacy".into(),
+                assets: Some("legacy".into()),
+                asset_index: Some(index),
+                ..Default::default()
+            },
+            jar_version: "legacy".into(),
+            chain: vec!["legacy".into()],
+        };
+        let assets = core.paths.assets.clone();
+        let object_path = assets
+            .join("objects")
+            .join(&object_hash[..2])
+            .join(&object_hash);
+        let index_path = assets.join("indexes/legacy.json");
+        tokio::fs::create_dir_all(object_path.parent().expect("object parent"))
+            .await
+            .expect("object directory");
+        tokio::fs::create_dir_all(index_path.parent().expect("index parent"))
+            .await
+            .expect("index directory");
+        tokio::fs::write(&object_path, object_bytes)
+            .await
+            .expect("object");
+        tokio::fs::write(&index_path, &index_bytes)
+            .await
+            .expect("index");
+
+        assert!(core
+            .ensure_assets(&instance, &resolved, true)
+            .await
+            .expect("ensure")
+            .is_empty());
         assert_eq!(
-            substitute_data("--input {MC_SLIM}", &data, &extra).expect("known"),
-            "--input /tmp/slim.jar"
+            tokio::fs::read(assets.join("virtual/legacy/minecraft/lang/en_us.lang"))
+                .await
+                .expect("logical asset"),
+            object_bytes
         );
-        assert!(substitute_data("--x {NOPE}", &data, &extra).is_err());
+
+        tokio::fs::remove_file(&object_path).await.expect("remove object");
+        tokio::fs::remove_file(assets.join("virtual/legacy/minecraft/lang/en_us.lang"))
+            .await
+            .expect("remove logical asset");
+        let missing = core
+            .ensure_assets(&instance, &resolved, true)
+            .await
+            .expect("missing report");
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].contains("minecraft/lang/en_us.lang"));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_asset_is_materialized_at_logical_path() {
+        let root = std::env::temp_dir().join(format!("cube-legacy-assets-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let source = root.join("objects/ab/abcdef");
+        let destination = root.join("virtual/legacy/minecraft/lang/en_us.lang");
+        tokio::fs::create_dir_all(source.parent().expect("object parent"))
+            .await
+            .expect("object directory");
+        tokio::fs::write(&source, b"abc").await.expect("object");
+        materialize_legacy_asset(&source, &destination, 3)
+            .await
+            .expect("materialize");
+        assert_eq!(tokio::fs::read(&destination).await.expect("logical asset"), b"abc");
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

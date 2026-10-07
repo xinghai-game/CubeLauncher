@@ -27,7 +27,7 @@
     "active": true,
     "targets": ["appimage", "deb", "nsis", "dmg"],
     "shortDescription": "轻量、可控的 Minecraft Java 启动器",
-    "longDescription": "CubeLauncher 是一个支持离线账户、实例隔离和多加载器的 Minecraft Java 桌面启动器。",
+    "longDescription": "CubeLauncher 是一个支持 Microsoft 正版登录与离线身份、实例隔离和多加载器的 Minecraft Java 桌面启动器。",
     "category": "Game",
     "createUpdaterArtifacts": false
   }

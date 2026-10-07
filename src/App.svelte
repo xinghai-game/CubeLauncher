@@ -9,6 +9,7 @@
   import VersionCatalogPage from './components/VersionCatalogPage.svelte';
   import InstallWizard from './components/InstallWizard.svelte';
   import InstallProgressPage from './components/InstallProgressPage.svelte';
+  import ImportPage from './components/ImportPage.svelte';
   import SettingsPage from './components/SettingsPage.svelte';
   import SettingsSectionPage from './components/SettingsSectionPage.svelte';
   import Overlays from './components/Overlays.svelte';
@@ -36,21 +37,27 @@
   <div class="body">
     <Sidebar />
     <main class="main-content">
-      {#if ui.route.name === 'home'}
-        <HomePage />
-      {:else if ui.route.name === 'instances'}
-        <InstancesPage />
-      {:else if ui.route.name === 'versions'}
-        <VersionCatalogPage />
-      {:else if ui.route.name === 'wizard'}
-        <InstallWizard />
-      {:else if ui.route.name === 'install'}
-        <InstallProgressPage />
-      {:else if ui.route.section}
-        <SettingsSectionPage />
-      {:else}
-        <SettingsPage />
-      {/if}
+      <!-- `.page` is the centred column: the window itself never scrolls, so this
+           element owns the (rare) overflow instead of the document. -->
+      <div class="page">
+        {#if ui.route.name === 'home'}
+          <HomePage />
+        {:else if ui.route.name === 'instances'}
+          <InstancesPage />
+        {:else if ui.route.name === 'versions'}
+          <VersionCatalogPage />
+        {:else if ui.route.name === 'wizard'}
+          <InstallWizard />
+        {:else if ui.route.name === 'install'}
+          <InstallProgressPage />
+        {:else if ui.route.name === 'import'}
+          <ImportPage />
+        {:else if ui.route.section}
+          <SettingsSectionPage />
+        {:else}
+          <SettingsPage />
+        {/if}
+      </div>
     </main>
   </div>
 </div>

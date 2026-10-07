@@ -11,6 +11,14 @@ pub const ADOPTIUM_API: &str = "https://api.adoptium.net/v3";
 pub const RESOURCES_URL: &str = "https://resources.download.minecraft.net";
 pub const LAUNCHER_NAME: &str = "CubeLauncher";
 pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Application id used for the Microsoft sign-in. It is the well-known public
+/// client used by Minecraft launchers for the device code flow, so no secret is
+/// involved and nothing has to be registered to build this launcher. Users can
+/// point the launcher at their own Microsoft Entra application in the settings.
+pub const MICROSOFT_CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
+/// `offline_access` is what makes the sign-in survive a restart: it yields the
+/// refresh token the launcher stores instead of a password.
+pub const MICROSOFT_SCOPE: &str = "XboxLive.signin offline_access";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppSettings {
@@ -36,6 +44,10 @@ pub struct AppSettings {
     pub java_mirror_base_url: Option<String>,
     #[serde(default)]
     pub close_launcher_after_launch: bool,
+    /// Microsoft Entra application id used for 正版 sign-in. `None` means the
+    /// built-in public client id; setting it lets a fork use its own application.
+    #[serde(default)]
+    pub microsoft_client_id: Option<String>,
 }
 fn default_theme() -> String {
     "dark".into()
@@ -66,17 +78,111 @@ impl Default for AppSettings {
             mirror_base_url: None,
             java_mirror_base_url: None,
             close_launcher_after_launch: false,
+            microsoft_client_id: None,
         }
     }
 }
 
+/// Tokens and identity of one Microsoft (正版) account.
+///
+/// Only the refresh token is long-lived; the Minecraft access token is derived
+/// again whenever it is about to expire, so a stale `access_token` here is
+/// harmless. Both live in `accounts.json`, which is written owner-only on Unix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MicrosoftAccount {
+    /// Xbox user id, passed to the game as `--xuid`.
+    #[serde(default)]
+    pub xuid: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub access_expires_at: Option<DateTime<Utc>>,
+    /// Official skin texture, so the account list can show the real head.
+    #[serde(default)]
+    pub skin_url: Option<String>,
+    /// Result of the last store lookup; informational, the profile is what
+    /// actually proves the account owns the game.
+    #[serde(default)]
+    pub owns_java: bool,
+    #[serde(default)]
+    pub last_login: Option<DateTime<Utc>>,
+}
+
+/// One selectable identity: an offline role or a Microsoft account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfflineAccount {
+pub struct Account {
+    /// Stable id: the undashed UUID for Microsoft accounts, the derived offline
+    /// UUID for offline roles. Instances reference it through `account_id`.
     pub id: String,
     pub name: String,
+    /// Dashed UUID, as Mojang reports it.
     pub uuid: String,
+    /// `offline` or `microsoft`.
     pub kind: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microsoft: Option<MicrosoftAccount>,
+}
+
+impl Account {
+    pub fn is_microsoft(&self) -> bool {
+        self.kind == "microsoft"
+    }
+    /// Undashed UUID, which is what the game expects on the command line.
+    pub fn undashed_uuid(&self) -> String {
+        self.uuid.replace('-', "")
+    }
+}
+
+/// What the user has to do to finish a device code sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceCodePrompt {
+    /// Handle for polling; it is the device code, and it never leaves the launcher.
+    pub login_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub message: String,
+    pub expires_in: u64,
+    /// Seconds the caller must wait between two polls.
+    pub interval: u64,
+}
+
+/// One poll of a pending device code sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LoginPoll {
+    /// The user has not finished on Microsoft's page yet.
+    Pending,
+    /// Microsoft asked for a slower poll; the caller should wait longer.
+    SlowDown,
+    Ready {
+        account: Box<Account>,
+    },
+    Expired,
+    Declined,
+    Failed {
+        message: String,
+    },
+}
+
+/// Everything the launch command line needs about the identity being used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSession {
+    pub name: String,
+    /// Undashed UUID, for `--uuid`.
+    pub uuid: String,
+    /// Value for the legacy `--session` argument.
+    pub session: String,
+    /// Minecraft access token, for `--accessToken`.
+    pub access_token: String,
+    /// `msa` for Microsoft accounts, `legacy` for offline roles.
+    pub user_type: String,
+    /// Xbox user id, for `--xuid`.
+    pub xuid: String,
+    /// Value for `--clientId`; empty for offline roles.
+    pub client_id: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,8 +244,48 @@ pub struct Instance {
     pub created_at: DateTime<Utc>,
 }
 
+/// One game version found inside a `.minecraft` directory during an import scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameDirVersion {
+    /// Version folder name, e.g. `1.20.1-forge-47.4.26`.
+    pub id: String,
+    /// Vanilla version this one builds on.
+    pub game_version: String,
+    pub loader: Loader,
+    #[serde(default)]
+    pub loader_version: Option<String>,
+    /// Version document this one inherits from, when any.
+    #[serde(default)]
+    pub inherits_from: Option<String>,
+    /// True when `<id>.jar` sits next to the version document.
+    pub jar: bool,
+    /// True when the document names a main class, so it can be started directly.
+    pub launchable: bool,
+    /// What the launcher recognised, when that is worth telling the user.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// True when this version is already registered as an instance.
+    pub imported: bool,
+}
+
+/// What one directory looks like before it is imported as an instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameDirScan {
+    /// The `.minecraft` directory that was actually read.
+    pub game_dir: PathBuf,
+    /// True when a nested `.minecraft` inside the picked folder was used.
+    pub nested: bool,
+    /// Versions found, newest first.
+    pub versions: Vec<GameDirVersion>,
+    pub mod_count: usize,
+    pub save_count: usize,
+    pub has_libraries: bool,
+    pub has_assets: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JavaRuntime {
+    pub path: PathBuf,
     pub major: u32,
     pub architecture: String,
     pub vendor: Option<String>,
@@ -391,7 +537,7 @@ pub struct AssetsFile {
     pub objects: HashMap<String, AssetObject>,
     #[serde(default)]
     pub map_to_resources: Option<bool>,
-    #[serde(default)]
+    #[serde(default, rename = "virtual")]
     pub virtual_: Option<bool>,
 }
 
@@ -451,6 +597,17 @@ pub struct InstallLock {
     pub mods_managed: bool,
 }
 
+/// One file transferring right now. Segment workers of the same file share one
+/// entry, so `downloaded` covers every byte of that file already on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveDownload {
+    /// Display label from the plan, or the destination path when it has none.
+    pub name: String,
+    pub downloaded: u64,
+    /// Declared size; `0` when upstream never published one.
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstallTask {
     pub id: String,
@@ -462,6 +619,15 @@ pub struct InstallTask {
     pub done: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// Bytes of the current batch already on disk, and its known total. Files
+    /// without a published size are counted in neither.
+    #[serde(default)]
+    pub downloaded_bytes: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    /// Files transferring right now, largest first.
+    #[serde(default)]
+    pub active: Vec<ActiveDownload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -68,10 +68,11 @@ impl crate::LauncherCore {
             .install_lock(&instance.id)
             .await
             .ok_or_else(|| anyhow!("实例尚未安装，请先安装"))?;
-        let resolved = self.resolved_for(&instance.id).await?;
+        let resolved = self.resolved_for(instance).await?;
         let meta = &resolved.meta;
-        let account = self.account_for(instance).await;
-        let game_dir = self.paths.game_dir(&instance.id);
+        let session = self.auth_session_for(instance).await?;
+        let layout = self.layout(instance);
+        let game_dir = layout.game_dir.clone();
         tokio::fs::create_dir_all(&game_dir).await?;
 
         // Pick Java first: library rules follow the runtime that will start the game.
@@ -100,13 +101,14 @@ impl crate::LauncherCore {
 
         // Native extraction must happen before we point the JVM at the directory.
         self.extract_natives(instance, &resolved).await?;
-        let natives_dir = self.paths.natives_dir(&instance.id);
+        let natives_dir = layout.natives_dir.clone();
         tokio::fs::create_dir_all(&natives_dir).await?;
 
-        // Classpath: version jar first, then every allowed library artifact.
+        // Classpath: version jar first, then every allowed library artifact. Each
+        // file is taken from the game directory when it has one.
         let mut classpath: Vec<PathBuf> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
-        match self.version_jar_for(&meta.id, &resolved.jar_version) {
+        match self.version_jar_for(instance, &meta.id, &resolved.jar_version) {
             Some(jar) => classpath.push(jar),
             None => missing.push(format!("版本 JAR {}", resolved.jar_version)),
         }
@@ -115,39 +117,35 @@ impl crate::LauncherCore {
                 continue;
             }
             if let Some((path, _url)) = classpath_entry(library, &platform) {
-                let dest = self.paths.libraries.join(&path);
-                if dest.is_file() {
-                    classpath.push(dest);
-                } else {
-                    missing.push(path);
+                match layout.library(&path) {
+                    Some(found) => classpath.push(found),
+                    None => missing.push(path),
                 }
             }
         }
+        missing.extend(self.ensure_assets(instance, &resolved, true).await?);
         let log_config = meta
             .logging
             .as_ref()
             .and_then(|logging| logging.client.as_ref())
-            .map(|_| self.log_config_path(&meta.id))
-            .filter(|path| path.is_file());
+            .and_then(|_| layout.asset(&format!("log_configs/{}.xml", meta.id)));
 
         let separator = if cfg!(windows) { ";" } else { ":" };
         let mut variables = LaunchVariables::default();
-        variables.insert("auth_player_name", account.name.clone());
-        variables.insert("auth_uuid", account.uuid.replace('-', ""));
-        variables.insert("auth_access_token", "0");
-        variables.insert("auth_session", format!("token:0:{}", account.uuid));
-        variables.insert("auth_xuid", "");
-        variables.insert("clientid", "");
-        variables.insert("user_type", "legacy");
-        variables.insert("user_properties", "{}");
+        for (name, value) in identity_variables(&session) {
+            variables.insert(name, value);
+        }
         variables.insert("version_name", meta.id.clone());
         variables.insert("version_type", "release");
         variables.insert("game_directory", game_dir.display().to_string());
-        variables.insert("assets_root", self.paths.assets.display().to_string());
+        // Libraries and assets come from the instance's own game directory when it
+        // has them: modern Forge builds a module path out of `${library_directory}`,
+        // so that variable has to name the folder that really holds the jars.
+        variables.insert("assets_root", layout.assets.display().to_string());
         variables.insert("assets_index_name", meta.assets.clone().unwrap_or_default());
         variables.insert(
             "game_assets",
-            self.paths
+            layout
                 .assets
                 .join("virtual")
                 .join("legacy")
@@ -157,10 +155,7 @@ impl crate::LauncherCore {
         variables.insert("natives_directory", natives_dir.display().to_string());
         variables.insert("launcher_name", LAUNCHER_NAME);
         variables.insert("launcher_version", LAUNCHER_VERSION);
-        variables.insert(
-            "library_directory",
-            self.paths.libraries.display().to_string(),
-        );
+        variables.insert("library_directory", layout.libraries.display().to_string());
         variables.insert(
             "classpath",
             classpath
@@ -393,21 +388,69 @@ impl crate::LauncherCore {
         self.verify_instance(instance).await
     }
 
-    async fn account_for(&self, instance: &Instance) -> OfflineAccount {
+    /// Identity an instance starts with: its own account when it has one,
+    /// otherwise the first stored account, otherwise a local role so a fresh
+    /// installation can still be started.
+    async fn account_for(&self, instance: &Instance) -> Account {
         let accounts = self.accounts().await.unwrap_or_default();
         accounts
             .iter()
             .find(|account| Some(&account.id) == instance.account_id.as_ref())
             .cloned()
             .or_else(|| accounts.first().cloned())
-            .unwrap_or_else(|| OfflineAccount {
+            .unwrap_or_else(|| Account {
                 id: crate::instance::offline_uuid("Player"),
                 name: "Player".into(),
                 uuid: crate::instance::offline_uuid("Player"),
                 kind: "offline".into(),
                 created_at: chrono::Utc::now(),
+                microsoft: None,
             })
     }
+
+    /// Launch identity with a Minecraft token that is still valid. A 正版
+    /// account is refreshed when its token is close to expiring, and the new
+    /// tokens are written back so the next launch reuses them. Strict offline
+    /// mode never reaches out: it either has a usable token or says why not.
+    async fn auth_session_for(&self, instance: &Instance) -> Result<AuthSession> {
+        let account = self.account_for(instance).await;
+        let fresh = self
+            .auth
+            .ensure_fresh(&account, !self.settings.offline_mode)
+            .await?;
+        let refreshed = fresh
+            .microsoft
+            .as_ref()
+            .map(|auth| auth.access_token.clone())
+            != account
+                .microsoft
+                .as_ref()
+                .map(|auth| auth.access_token.clone());
+        if refreshed {
+            if let Err(error) = self.update_account(&fresh).await {
+                tracing::warn!("保存刷新后的登录凭证失败：{error:#}");
+            }
+        }
+        Ok(crate::auth::session_for(&fresh))
+    }
+}
+
+/// The `auth_*` placeholders the version metadata expands.
+///
+/// For 正版 accounts these carry the real Minecraft token, XUID and `msa` user
+/// type, which is what an online-mode server verifies; offline roles keep the
+/// legacy shape the game has always accepted.
+fn identity_variables(session: &AuthSession) -> [(&'static str, String); 8] {
+    [
+        ("auth_player_name", session.name.clone()),
+        ("auth_uuid", session.uuid.clone()),
+        ("auth_access_token", session.access_token.clone()),
+        ("auth_session", session.session.clone()),
+        ("auth_xuid", session.xuid.clone()),
+        ("clientid", session.client_id.clone()),
+        ("user_type", session.user_type.clone()),
+        ("user_properties", "{}".to_string()),
+    ]
 }
 
 fn spawn_reader<R>(reader: R, stream: &'static str, logs: mpsc::Sender<LogLine>, log_path: PathBuf)
@@ -457,5 +500,88 @@ async fn append_log_line(path: &PathBuf, line: &str) {
     {
         let _ = file.write_all(line.as_bytes()).await;
         let _ = file.write_all(b"\n").await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variables(session: &AuthSession) -> crate::meta::LaunchVariables {
+        let mut variables = crate::meta::LaunchVariables::default();
+        for (name, value) in identity_variables(session) {
+            variables.insert(name, value);
+        }
+        variables
+    }
+
+    /// The placeholders that matter for playing online, expanded the way the
+    /// version metadata expands them.
+    #[test]
+    fn microsoft_identity_reaches_the_command_line() {
+        let session = AuthSession {
+            name: "Steve".into(),
+            uuid: "069a79f444e94726a5befca90e38aaf5".into(),
+            session: "token:mc-access:069a79f4-44e9-4726-a5be-fca90e38aaf5".into(),
+            access_token: "mc-access".into(),
+            user_type: "msa".into(),
+            xuid: "2535412345678901".into(),
+            client_id: "c0b1a2d3-0000-4000-8000-000000000001".into(),
+        };
+        let variables = variables(&session);
+        for (template, expected) in [
+            ("--username ${auth_player_name}", "--username Steve"),
+            (
+                "--uuid ${auth_uuid}",
+                "--uuid 069a79f444e94726a5befca90e38aaf5",
+            ),
+            (
+                "--accessToken ${auth_access_token}",
+                "--accessToken mc-access",
+            ),
+            ("--xuid ${auth_xuid}", "--xuid 2535412345678901"),
+            ("--userType ${user_type}", "--userType msa"),
+            (
+                "--clientId ${clientid}",
+                "--clientId c0b1a2d3-0000-4000-8000-000000000001",
+            ),
+            (
+                "--session ${auth_session}",
+                "--session token:mc-access:069a79f4-44e9-4726-a5be-fca90e38aaf5",
+            ),
+            ("--userProperties ${user_properties}", "--userProperties {}"),
+        ] {
+            assert_eq!(
+                crate::meta::substitute(template, &variables).expect("known placeholder"),
+                expected,
+                "template {template}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_identity_keeps_the_legacy_shape() {
+        let uuid = crate::instance::offline_uuid("Alice");
+        let session = crate::auth::session_for(&Account {
+            id: uuid.clone(),
+            name: "Alice".into(),
+            uuid: uuid.clone(),
+            kind: "offline".into(),
+            created_at: chrono::Utc::now(),
+            microsoft: None,
+        });
+        let variables = variables(&session);
+        assert_eq!(
+            crate::meta::substitute("--accessToken ${auth_access_token}", &variables).unwrap(),
+            "--accessToken 0"
+        );
+        assert_eq!(
+            crate::meta::substitute("--userType ${user_type}", &variables).unwrap(),
+            "--userType legacy"
+        );
+        assert_eq!(
+            crate::meta::substitute("--uuid ${auth_uuid}", &variables).unwrap(),
+            format!("--uuid {}", uuid.replace('-', ""))
+        );
     }
 }

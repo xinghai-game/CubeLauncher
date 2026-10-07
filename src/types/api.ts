@@ -3,13 +3,60 @@ import { listen } from '@tauri-apps/api/event';
 
 export type Loader = 'vanilla' | 'fabric' | 'forge' | 'neoforge';
 
-export type Account = { id: string; name: string; uuid: string; kind: string; created_at: string };
+/**
+ * Identity status of a 正版 account. Tokens never cross the IPC boundary: the
+ * core keeps them, the UI only learns whether one is still usable and whether
+ * the launcher can renew it on its own.
+ */
+export type MicrosoftAccount = {
+  xuid: string;
+  owns_java: boolean;
+  /** When the current Minecraft token stops working. */
+  expires_at?: string | null;
+  /** Still usable right now (refreshes happen at launch, not here). */
+  token_valid: boolean;
+  skin_url?: string | null;
+  last_login?: string | null;
+  /** A refresh token is stored, so a new session needs no user interaction. */
+  refreshable: boolean;
+};
+
+export type Account = {
+  id: string;
+  name: string;
+  uuid: string;
+  kind: 'offline' | 'microsoft' | string;
+  created_at: string;
+  microsoft?: MicrosoftAccount | null;
+};
+
+/** What the user has to type on Microsoft's page to finish a sign-in. */
+export type DeviceCodePrompt = {
+  login_id: string;
+  user_code: string;
+  verification_uri: string;
+  message: string;
+  expires_in: number;
+  interval: number;
+};
+
+/** One poll of a pending sign-in. */
+export type LoginStatus = {
+  state: 'pending' | 'slow_down' | 'ready' | 'expired' | 'declined' | 'failed';
+  account?: Account;
+  message?: string;
+  interval?: number;
+};
 
 export type Instance = {
   id: string;
   name: string;
   game_version: string;
   loader: Loader;
+  /** Version folder the game directory uses; set for imported installations. */
+  version_id?: string | null;
+  /** Imported `.minecraft`; `null` means the launcher-managed directory. */
+  game_dir?: string | null;
   loader_version?: string | null;
   account_id?: string | null;
   java_path?: string | null;
@@ -23,6 +70,30 @@ export type Instance = {
   installed: boolean;
   last_played?: string | null;
   created_at: string;
+};
+
+/** One version found inside a directory the user picked for import. */
+export type GameDirVersion = {
+  id: string;
+  game_version: string;
+  loader: Loader;
+  loader_version?: string | null;
+  inherits_from?: string | null;
+  jar: boolean;
+  launchable: boolean;
+  note?: string | null;
+  imported: boolean;
+};
+
+/** What a directory looks like before it becomes an instance. */
+export type GameDirScan = {
+  game_dir: string;
+  nested: boolean;
+  versions: GameDirVersion[];
+  mod_count: number;
+  save_count: number;
+  has_libraries: boolean;
+  has_assets: boolean;
 };
 
 export type Runtime = {
@@ -45,6 +116,8 @@ export type Settings = {
   mirror_base_url?: string | null;
   java_mirror_base_url?: string | null;
   close_launcher_after_launch: boolean;
+  /** Microsoft Entra application id; `null` uses the built-in public client. */
+  microsoft_client_id?: string | null;
 };
 
 export type VersionKind = 'release' | 'snapshot' | 'old_beta' | 'old_alpha' | 'april_fools';
@@ -73,6 +146,15 @@ export type VersionCatalog = {
 /** Java major a version needs; `source` says how it was determined. */
 export type JavaRequirement = { major: number; source: string };
 
+/** One file transferring right now, as reported by the backend. */
+export type ActiveDownload = {
+  /** Plan label, or the file name when the plan has no label. */
+  name: string;
+  downloaded: number;
+  /** Declared size; `0` when upstream never published one. */
+  total: number;
+};
+
 export type Task = {
   id: string;
   instance_id: string;
@@ -82,6 +164,11 @@ export type Task = {
   message: string;
   done: boolean;
   error?: string | null;
+  /** Bytes of the current batch on disk, and its known total. */
+  downloaded_bytes: number;
+  total_bytes: number;
+  /** Files transferring right now, largest first. */
+  active: ActiveDownload[];
 };
 
 export type LogLine = { stream: string; line: string; timestamp: string };
@@ -167,10 +254,50 @@ export const manifestSourceLabels: Record<ManifestSource, string> = {
   mirror: '镜像'
 };
 
+export function accountKindLabel(account: Account | null | undefined): string {
+  return account?.kind === 'microsoft' ? '正版账户' : '离线身份';
+}
+
+/**
+ * Head of an official skin texture, drawn with CSS: the face lives at (8,8) of
+ * a 64×64 sheet and its hat overlay at (40,8). Both layers are the same data
+ * URL, so one element renders the complete head.
+ */
+export function skinHeadStyle(dataUrl: string): string {
+  const quoted = `url("${dataUrl}")`;
+  return `background-image:${quoted},${quoted};background-position:-30px -30px,-150px -30px;`;
+}
+
+/** True when a 正版 account needs a refresh before it can be launched. */
+export function needsRefresh(account: Account | null | undefined): boolean {
+  return Boolean(account?.microsoft && !account.microsoft.token_valid);
+}
+
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+}
+
+/** True when the instance plays in an imported `.minecraft` of its own. */
+export function isImported(instance: Instance | null | undefined): boolean {
+  return Boolean(instance?.game_dir);
+}
+
+/**
+ * Game directory the core will use, mirroring its own rule: the imported folder
+ * when there is one, otherwise `instances/<id>/.minecraft` inside the data dir.
+ */
+export function instanceGameDir(instance: Instance, dataDir: string): string {
+  if (instance.game_dir) return instance.game_dir;
+  return `${dataDir.replace(/[\\/]+$/, '')}/instances/${instance.id}/.minecraft`;
+}
+
+/** Short label for a game directory, for lists and summaries. */
+export function shortPath(path: string, segments = 2): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= segments) return path;
+  return `…/${parts.slice(-segments).join('/')}`;
 }
 
 export function formatPlayed(value?: string | null): string {

@@ -117,7 +117,7 @@ fn detect_os_version() -> String {
     }
 }
 
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+pub(crate) fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
     let parse = |value: &str| -> Vec<u32> {
         value
             .split(|c: char| !c.is_ascii_digit())

@@ -1,11 +1,11 @@
 <script lang="ts">
   import {
-    Cpu, Download, HardDrive, LoaderCircle, Play, Plus, ShieldCheck, Sparkles, Square
+    Cpu, Download, FolderInput, HardDrive, LoaderCircle, Play, Plus, ShieldCheck, Sparkles, Square
   } from 'lucide-svelte';
   import { app, ui } from '../lib/state.svelte';
-  import { loaderColors, loaderLabels, formatPlayed } from '../types/api';
+  import { loaderColors, loaderLabels, formatPlayed, isImported, shortPath } from '../types/api';
   import {
-    activeAccount, goInstances, goVersions, goWizard, installInstance, launchSelected,
+    activeAccount, goImport, goInstances, goVersions, goWizard, installInstance, launchSelected,
     selectInstance, stopSelected
   } from '../lib/actions';
 
@@ -13,6 +13,9 @@
   const running = $derived(new Set(app.data.running));
   const installed = $derived(app.data.instances.filter((item) => item.installed).length);
   const recent = $derived(app.data.instances[0] ?? null);
+  // Waiting for the game process to exit must not disable the page: only the
+  // moment between the click and the process state event counts as launching.
+  const launching = $derived(Boolean(recent && app.launchingId === recent.id));
 
   async function openRecent(id: string) {
     await goInstances();
@@ -27,6 +30,7 @@
     <p class="subtitle">安装一次之后，断网也能直接进入世界。</p>
   </div>
   <div class="head-actions">
+    <button class="button ghost" onclick={() => goImport()}><FolderInput size={16}/>导入 .minecraft</button>
     <button class="button primary" onclick={() => goVersions()}><Plus size={17}/>安装新游戏</button>
   </div>
 </div>
@@ -40,7 +44,9 @@
       <p>从版本目录挑一个游戏版本，再选加载器，启动器会自动准备 Java、依赖与资源。</p>
       <div class="hero-buttons">
         <button class="button hero-primary" onclick={() => goVersions()}><Plus size={16}/>浏览版本目录</button>
+        <button class="button ghost" onclick={() => goImport()}><FolderInput size={16}/>导入已有 .minecraft</button>
       </div>
+      <p class="help-text">已经用官方启动器、HMCL 或 PCL 玩过？导入那个目录即可，文件不会被复制。</p>
     </div>
     <div class="hero-art">
       <div class="sun"></div><div class="mountain mountain-back"></div>
@@ -63,13 +69,13 @@
         {:else}
           <button
             class="button hero-primary"
-            disabled={app.busy}
+            disabled={launching}
             onclick={() => {
               void selectInstance(recent.id);
               return recent.installed ? launchSelected() : installInstance(recent.id);
             }}
           >
-            {#if app.busy}<LoaderCircle class="spin" size={16}/>
+            {#if launching}<LoaderCircle class="spin" size={16}/>
             {:else if recent.installed}<Play size={16}/>
             {:else}<Download size={16}/>{/if}
             {recent.installed ? '启动游戏' : '安装实例'}
@@ -109,6 +115,11 @@
       <div class="instance-card-meta">
         <span>{instance.game_version}</span><span class="meta-sep">·</span><span>{loaderLabels[instance.loader]}</span>
       </div>
+      {#if isImported(instance)}
+        <div class="instance-card-meta">
+          <span class="played">外部目录 {shortPath(instance.game_dir ?? '')}</span>
+        </div>
+      {/if}
       <div class="card-bottom">
         <span class="played">{formatPlayed(instance.last_played)}</span>
         <span class="played">{instance.max_memory_mb} MB</span>
@@ -118,6 +129,10 @@
   <button class="new-card" onclick={() => goVersions()}>
     <span><Plus size={20}/></span><strong>安装新游戏</strong>
     <small>原版、Fabric、Forge 或 NeoForge</small>
+  </button>
+  <button class="new-card" onclick={() => goImport()}>
+    <span><FolderInput size={20}/></span><strong>导入 .minecraft</strong>
+    <small>直接使用已有目录，不复制文件</small>
   </button>
 </section>
 

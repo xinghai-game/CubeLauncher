@@ -1,6 +1,6 @@
 <script lang="ts">
   import {
-    ChevronRight, Coffee, FolderOpen, HardDrive, Info, Moon, ShieldCheck, SlidersHorizontal
+    ChevronRight, Coffee, FolderOpen, HardDrive, Info, Moon, ShieldCheck, SlidersHorizontal, Users
   } from 'lucide-svelte';
   import { app, ui, type SettingsSection } from '../lib/state.svelte';
   import { settingsSections } from '../lib/settings';
@@ -10,6 +10,7 @@
 
   const icons: Record<SettingsSection, typeof FolderOpen> = {
     general: FolderOpen,
+    account: Users,
     download: HardDrive,
     java: Coffee,
     appearance: Moon,
@@ -20,6 +21,11 @@
     switch (section) {
       case 'general':
         return `${draft.data_dir} · ${draft.offline_mode ? '严格离线' : '按需联网'}`;
+      case 'account': {
+        const microsoft = app.data.accounts.filter((account) => account.kind === 'microsoft').length;
+        const offline = app.data.accounts.length - microsoft;
+        return `${microsoft} 个正版 · ${offline} 个离线角色`;
+      }
       case 'download':
         return `${draft.download_concurrency} 路并行 · ${draft.mirror_base_url || '官方源'}`;
       case 'java':

@@ -1,9 +1,17 @@
 <script lang="ts">
-  import { Check, ChevronDown, Cpu, ShieldCheck, SlidersHorizontal, TerminalSquare } from 'lucide-svelte';
+  import {
+    Check, ChevronDown, Cpu, FolderInput, FolderOpen, RotateCcw, ShieldCheck, SlidersHorizontal,
+    TerminalSquare
+  } from 'lucide-svelte';
   import { app, ui } from '../lib/state.svelte';
-  import { saveInstanceDraft, showPreview } from '../lib/actions';
+  import { instanceGameDir, isImported, shortPath } from '../types/api';
+  import { goImport, openFolder, saveInstanceDraft, showPreview, unbindGameDir } from '../lib/actions';
 
   const previewArgs = $derived(app.preview ? app.preview.args.join(' ') : '');
+  const imported = $derived(isImported(ui.instanceDraft));
+  const gameDir = $derived(
+    ui.instanceDraft ? instanceGameDir(ui.instanceDraft, app.data.data_dir) : ''
+  );
 </script>
 
 {#if ui.instanceDraft}
@@ -27,6 +35,43 @@
         </span>
       </label>
       <p class="help-text">已发现 {app.data.java.length} 个运行时，缺少时可在“启动器设置 → Java 运行时”里下载。</p>
+    </section>
+
+    <section class="settings-card">
+      <div class="settings-card-head">
+        <span class="stat-icon purple"><FolderInput size={17}/></span>
+        <div>
+          <strong>游戏目录</strong>
+          <small>{imported ? '导入的 .minecraft：文件留在原处，不会复制' : '启动器管理的独立 .minecraft'}</small>
+        </div>
+      </div>
+      <div class="summary-row">
+        <span>{imported ? '外部 .minecraft' : '启动器管理'}</span>
+        <strong class="path">{gameDir}</strong>
+      </div>
+      {#if imported}
+        <div class="summary-row">
+          <span>版本文件夹</span>
+          <strong>{draft.version_id ?? draft.game_version}</strong>
+        </div>
+        <div class="summary-row">
+          <span>简写</span>
+          <strong>{shortPath(gameDir)}</strong>
+        </div>
+      {/if}
+      <div class="detail-actions wrap">
+        <button class="button ghost" onclick={() => openFolder('game')}><FolderOpen size={15}/>打开目录</button>
+        <button class="button ghost" onclick={() => goImport(draft.id)}>
+          <FolderInput size={15}/>{imported ? '更换目录' : '绑定已有 .minecraft'}
+        </button>
+        {#if imported}
+          <button class="button ghost" onclick={unbindGameDir}><RotateCcw size={15}/>恢复默认目录</button>
+        {/if}
+      </div>
+      <p class="help-text">
+        存档、模组与截图都在这个目录里；导入的目录由原启动器与 CubeLauncher 共用，
+        删除实例不会删除它。
+      </p>
     </section>
 
     <section class="settings-card">
