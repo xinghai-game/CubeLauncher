@@ -9,7 +9,7 @@
     openInstance, refreshAccount, removeAccount
   } from '../lib/actions';
   import {
-    formatDateTime, formatPlayed, loaderLabels, needsRefresh, skinHeadStyle, type Account
+    formatDateTime, formatPlayed, loaderColors, loaderLabels, needsRefresh, skinHeadStyle, type Account
   } from '../types/api';
   import Breadcrumb from './Breadcrumb.svelte';
 
@@ -195,7 +195,7 @@
       <div class="account-instance-list">
         {#each instances as instance (instance.id)}
           <button class="account-instance-row" onclick={() => openInstance(instance.id)}>
-            <span class="loader-badge" style={`--loader-color:${instance.loader === 'vanilla' ? '#8b9a91' : instance.loader === 'fabric' ? '#62b890' : instance.loader === 'forge' ? '#f0a660' : '#d47c8f'}`}>
+            <span class="loader-badge" style={`--loader-color:${loaderColors[instance.loader]}`}>
               {instance.loader === 'vanilla' ? '◇' : instance.loader === 'fabric' ? '✣' : '◈'}
             </span>
             <span class="account-instance-copy"><strong>{instance.name}</strong><small>{instanceLabel(instance)} · {formatPlayed(instance.last_played)}</small></span>

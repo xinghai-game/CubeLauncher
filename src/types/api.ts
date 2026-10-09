@@ -237,8 +237,8 @@ export const loaderLabels: Record<Loader, string> = {
 };
 
 export const loaderColors: Record<Loader, string> = {
-  vanilla: '#8b9a91',
-  fabric: '#62b890',
+  vanilla: 'var(--text-accent)',
+  fabric: '#9684b5',
   forge: '#f0a660',
   neoforge: '#d47c8f'
 };

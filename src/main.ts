@@ -1,5 +1,6 @@
 import { mount } from 'svelte';
 import './styles.css';
+import './modern.css';
 import App from './App.svelte';
 
 // Svelte 5 requires `mount`; the legacy `new App({ target })` constructor leaves

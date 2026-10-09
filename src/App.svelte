@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { revealPage } from './lib/motion';
   import { ui } from './lib/state.svelte';
   import { bootstrap, connectEvents, refreshCatalog } from './lib/actions';
   import TitleBar from './components/TitleBar.svelte';
@@ -42,7 +43,7 @@
     <main class="main-content">
       <!-- `.page` is the centred column: the window itself never scrolls, so this
            element owns the (rare) overflow instead of the document. -->
-      <div class="page">
+      <div class="page" use:revealPage={ui.route.name + (ui.route.name === 'settings' ? `:${ui.route.section}` : ui.route.name === 'wizard' ? `:${ui.route.step}` : ui.route.name === 'instance' ? `:${ui.route.instanceId}:${ui.route.tab}` : ui.route.name === 'account' ? `:${ui.route.accountId}` : '')}>
         {#if ui.route.name === 'home'}
           <HomePage />
         {:else if ui.route.name === 'accounts'}
