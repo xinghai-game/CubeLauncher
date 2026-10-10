@@ -13,7 +13,7 @@ pub const LAUNCHER_NAME: &str = "CubeLauncher";
 pub const LAUNCHER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Application id compiled into the launcher for Microsoft device-code sign-in.
 /// It is public OAuth metadata and does not contain a secret.
-pub const MICROSOFT_CLIENT_ID: &str = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb";
+pub const MICROSOFT_CLIENT_ID: &str = "29f74a3b-a543-4aac-86cc-0f59d719bbe5";
 /// `offline_access` is what makes the sign-in survive a restart: it yields the
 /// refresh token the launcher stores instead of a password.
 pub const MICROSOFT_SCOPE: &str = "XboxLive.signin offline_access";
